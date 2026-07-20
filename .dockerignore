@@ -1,0 +1,22 @@
+# ビルドコンテキストを最小化(CPU ビルド機の転送時間短縮)。
+# 学習コードは実行時に git clone するのでイメージに入れない。
+.git
+data/
+checkpoints/
+wandb/
+__pycache__/
+*.pyc
+# 機密: トークン/APIキーは BuildKit secret 経由で渡す。コンテキストには入れない。
+# 先頭ドット有無・拡張子違いでの取りこぼしを防ぐため広めに除外する。
+hf_token.txt
+.hf_token.txt
+*.token
+*token*.txt
+*token*.key
+gemini_api_key
+*_api_key
+*api_key*.txt
+.secrets/
+secrets/
+*.pem
+BFCL学習τ2-bench評価.txt

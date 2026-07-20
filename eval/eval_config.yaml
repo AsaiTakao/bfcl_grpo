@@ -1,0 +1,63 @@
+# =============================================================================
+# τ-bench / τ2-bench 評価フェーズ定義(設計書「評価設計」)
+#
+# フェーズ0: mock + dummy_user   … API不要・壊れ検出。CP ごと毎回。
+# フェーズ1: retail + local user … API不要・傾向確認。有望な CP。
+# フェーズ2: retail/airline + gemini-3.5-flash … 公式条件準拠。最終 CP のみ。
+#
+# run_eval_pipeline.sh / run_tau_eval.py が読む。値は環境変数でも上書き可能。
+# =============================================================================
+
+# エージェント(評価対象 = 学習した Qwen3-8B)を vLLM OpenAI 互換で提供する前提。
+agent:
+  served_name: "qwen3-8b-bfcl"
+  base_url: "http://127.0.0.1:8000/v1"   # serve_agent_vllm.sh の待受
+  api_key: "EMPTY"                        # ローカル vLLM はダミーキー
+  provider: "openai"                      # tau-bench --model-provider(OpenAI互換)
+  strategy: "tool-calling"                # tau-bench --agent-strategy
+  # Qwen3 の thinking を評価でも発火させる(学習と条件を揃える)。
+  # vLLM 側で --reasoning-parser を有効化して <think> を分離する。
+  reasoning_parser: "qwen3"
+
+# tau-bench 共通設定。
+tau:
+  task_split: "test"
+
+phases:
+  phase0:
+    desc: "mock + dummy_user(壊れ検出、CPごと毎回)"
+    bench: "mock"                # ベンチ本体を使わず phase0_smoke.py で検証
+    user:
+      strategy: "dummy"          # 事前定義の決定的ユーザー(API不要)
+    num_tasks: 5
+
+  phase1:
+    desc: "retail + ローカル user(傾向確認、API不要)"
+    bench: "tau"                 # tau-bench
+    domain: "retail"
+    user:
+      strategy: "llm"
+      provider: "openai"         # OpenAI 互換
+      # ローカル user simulator も同じ vLLM エンドポイントを流用(外部API不要)。
+      base_url: "http://127.0.0.1:8000/v1"
+      model: "qwen3-8b-bfcl"
+      api_key: "EMPTY"
+    num_tasks: 30
+
+  phase2:
+    desc: "retail/airline + gemini-3.5-flash(公式準拠、最終CPのみ)"
+    bench: "tau"                 # telecom を測る場合は bench: tau2 / domain: telecom
+    domain: "airline"
+    user:
+      strategy: "llm"
+      provider: "google"         # litellm google provider = Google AI Studio(Gemini)
+      model: "gemini-3.5-flash"
+      # 実キーの渡し方(HF_TOKEN と同じ「ファイル管理」を最優先。優先順位は上から):
+      #   1) GEMINI_API_KEY_FILE がパスを指せば、そのファイルの中身を読む
+      #   2) 既定パス /run/secrets/gemini_api_key があれば読む(Docker secret 慣例)
+      #   3) 環境変数 GEMINI_API_KEY(従来互換)
+      # いずれもキー値は設定ファイル/コマンドラインに残さない。
+      api_key_file_env: "GEMINI_API_KEY_FILE"
+      api_key_file: "/run/secrets/gemini_api_key"
+      api_key_env: "GEMINI_API_KEY"
+    num_tasks: 0                  # 0 = 全タスク

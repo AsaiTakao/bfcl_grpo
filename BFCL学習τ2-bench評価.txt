@@ -1,0 +1,123 @@
+◆概要
+----------------------------------
+※MUA-RL 「Multi-turn User-interacting Agent RL for agentic tool use」を参考
+BFCL v3 multi-turn と τ-bench/τ2-bench を評価に使い、公式評価コードで測る。
+「一方で学習し、複数の独立ベンチマークで評価」を実践する。
+
+※「BFCL を指標に、実際に使える能力を上げる」
+学習: BFCL multi_turn (base + miss_param + miss_func)
+評価: τ-bench (retail/airline) または τ2-bench (telecom)
+----------------------------------------
+
+◆サーバ
+-------------------------------------------
+※GRPOはさくら　コンテナ型GPUクラウドサービス高火力DOK（NVIDIA H100
+8GPU 専有プラン（β版））
+
+※DockerFileのビルドはさくらのクラウドで安価な「CPUのみのLinuxインスタ
+ンス」を1台立ち上げ、そこを「開発・ビルド用の作業部屋」として使う
+
+※エラーも含めて、タスク終了後はリソース切断などの課金対策をコード上で行う。
+---------------------------------------
+
+◆評価設計
+-------------------------------------
+※まず mock で軽く回す
+学習: BFCL multi_turn (base + miss_param + miss_func) を verl/GRPO
+  ↓ チェックポイントごとに
+評価: τ-bench mock で汎化を軽くチェック（安価・高速）
+  ↓ 有望なら
+本評価: τ-bench retail/airline で本測定（LLM ユーザーシミュレータ）
+
+※ユーザーシミュレータをどうするか
+Google AI Studioの「gemini-3.5-flash」
+RL チェックポイント (verl が保存)
+  ↓ マージ (LoRA なら base に統合)
+  ↓ vLLM で OpenAI 互換エンドポイントとして起動 (agent = Qwen3-8B)
+  ↓
+τ2-bench:
+  フェーズ0: mock + dummy_user      (API不要、壊れ検出、CP ごと毎回)
+  フェーズ1: retail + ローカル user  (API不要、傾向確認)
+  フェーズ2: retail/airline +  gemini-3.5-flash(公式条件準拠、最終CPのみ)
+
+※確認すべき技術的ポイント（phase0 で洗い出す）
+think と tool_call パースの整合：学習と同じく評価でも Qwen3 の thinking を
+発火させる。τ2-bench はエージェント出力をパースするので、<think> が hermes パーサ
+の tool_call 抽出を壊さないか確認。壊れる場合は vLLM に --reasoning-parser
+（バージョン依存）を追加。これは phase0 を実際に回して見る点。
+
+--------------------------------------
+
+◆GRPO
+--------------------------------------------
+※MURPHY的報酬（Feedback-Aware GRPO）
+
+※rollout-onlyのFP8
+
+※LoRA(r=32)
+
+※EarlyStoppingCallBack(patience=3)
+
+※eval_stepsごとのtrain.logを記録
+
+--------------------------------
+
+◆ライブラリ
+--------------------------------------------
+※verl + vLLM
+●verl+vLLMのバージョン整合性を考慮しpytorch/pytorch:2.5.1-cuda12.4-cudnn9-devel
+（vllm/verl/torchaoの具体的なバージョン指定を組み込む）
+●verlのFSDP/vLLM側の設定(NCCL_ALGO、NCCL_P2P_LEVELなどの環境変数チューニング)
+●NCCL単体を最新版に手動アップグレードする（実際に8GPU全部でall_reduceが通るかを確認、
+実際に速くなっているか、ベンチマークで確認）
+----------------------------------------------
+
+◆DockerFile
+-------------------------------------------
+※pytorch/pytorch:2.5.1-cuda12.4-cudnn9-devel
+
+※エラーハンドリング（set -e）をつける
+
+※コードを頻繁に書き換えたい場合（コードの修正や実験を高速に回したい場合）
+●コードだけGitHub等のリモートリポジトリから引っ張ってくるDockerfile内には train.py 
+をコピーせず、CMD や実行時スクリプトの中で git clone や git pull を行い、起動する直
+前に最新のコードをダウンロードさせる。コンテナイメージの再ビルドが不要になります。
+●引数や設定は環境変数（Environment Variables）で渡す
+エポック数、バッチサイズ、学習率、使用するモデル名（Hugging Faceのレポジトリ名）など
+はコードに直接書かず、Pythonのos.getenv() を使って環境変数から読み込めるようにしてお
+きます。
+こうすれば、高火力DOKのコントロールパネル側で数値を書き換えるだけで、同じコンテナイメー
+ジのまま異なる実験が行えます。
+
+※タスク作成画面でコマンド/エントリーポイントを上書き可能なのでコマンドおよびエントリー
+ポイントはDockerfile内のCOMMAND/ENTRYPOINTを上書き（デバッグ時はentrypointをbashに差
+し替え確認）
+
+※モデルダウンロード用のHFトークンをビルド時にレイヤーへ残さない(トークンをファイルから渡す。シェル履歴にも残さない)
+
+※ダウンロード時間もタスクの課金対象時間に含まれる
+●hf_transferを有効化して並列・高速ダウンロード
+●モデル重みだけは例外的にイメージに焼き込む（Qwen/Qwen3-8B）
+--------------------------------------------
+
+◆entrypoint.shの設計
+-------------------------
+※学習途中の200stepsごとにcheckpointを複数回HFへアップロード
+●HFのGitリポジトリの同じ場所（例: checkpoint-current フォルダ）に毎回上書きで保存・Pushする方法です。
+ checkpointの上書きは最良evalと３つ（eval_lossが最良であっても、ベンチマークで最良とは限らないため）、
+ 直近chekcpoint３つの合計６つ残す（最良と直近が重複する場合は６つ未満となる。）
+●学習終了後、merge版のcheckpointをHFへアップロード(どのchekpointか、evalの数字を記録)
+
+※resume採用（途中中断があるので最新checkpointから再開できるようにする。）
+
+※非同期アップロードによる強制終了に注意
+Python スクリプトの最後に必ず数分間のバッファ（待ち時間）を設けるか、明示的に trainer.push_to_hub() を同期実行
+（完全に送信が終わるまで待つ処理）を挟むようにコードを組んでおく
+-------------------------
+
+
+
+
+
+
+

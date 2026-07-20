@@ -1,0 +1,31 @@
+# BFCL multi_turn を verl BaseTool として登録する設定。
+# actor_rollout_ref.rollout.tool_kwargs.tools_config_file にこのパスを指定する。
+tools:
+  - class_name: "bfcl_verl_tool.BFCLMultiTurnTool"
+    config:
+      type: native
+      # mt_reward.RewardConfig に渡す二層報酬パラメータ
+      gamma: 0.9            # outcome 後方伝播の割引
+      total_steps: 1000     # λ 減衰の総ステップ(trainer の総更新数に合わせる)
+      lam_start: 1.0        # process 重み初期値(密な shaping)
+      lam_end: 0.2          # process 重み終値(outcome に収束)
+      model_name: "rl_policy"
+    # BFCL の tool は動的に多数(GorillaFileSystem, TwitterAPI 等)だが、
+    # verl の tool_schema は「モデルに見せる関数シグネチャ」。
+    # BFCL では involved_classes のメソッド群がそれに当たる。
+    # ここでは schema をデータ側(test_entry)から動的供給する設計のため、
+    # 固定 schema は最小限にし、実際の関数定義は prompt 構築時に注入する。
+    tool_schema:
+      type: "function"
+      function:
+        name: "bfcl_multi_turn_call"
+        description: "Execute one or more BFCL backend tool calls for the current turn."
+        parameters:
+          type: "object"
+          properties:
+            tool_calls:
+              type: "array"
+              description: "List of {name, arguments} tool calls to issue this turn."
+              items:
+                type: "object"
+          required: ["tool_calls"]

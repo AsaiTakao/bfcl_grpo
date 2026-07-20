@@ -1,0 +1,27 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+.ipynb_checkpoints/
+# 大きな成果物はGitに入れない
+checkpoints/
+*.safetensors
+*.bin
+*.pt
+data/
+wandb/
+.env
+
+# secrets / credentials
+hf_token.txt
+.hf_token.txt
+*.token
+*token*.txt
+*token*.key
+gemini_api_key
+*_api_key
+*api_key*.txt
+.secrets/
+secrets/
+*.pem

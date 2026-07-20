@@ -1,0 +1,85 @@
+# syntax=docker/dockerfile:1.7
+# =============================================================================
+# τ-bench / τ2-bench 評価用イメージ(vLLM OpenAI 互換サービング)
+#
+# 学習イメージ(sglang, Dockerfile)とは分離した「評価専用」コンテナ。
+# 設計書フェーズ:
+#   RL checkpoint → マージ → vLLM で OpenAI 互換起動 → τ2-bench(phase0/1/2)
+#
+# 方針:
+#   - vLLM 公式イメージをベースにする(vllm CLI + reasoning/tool パーサ同梱)。
+#   - 評価コード(eval/ 一式)は実行時に git clone(学習側と同じ思想)。
+#   - モデルは既定でマージ済み HF モデルを HF から DL して serve(verl 不要=軽量)。
+#   - WITH_VERL=1 でビルドすると verl も入れ、コンテナ内マージも可能。
+#   - HF トークンはビルド時に焼かない(実行時に secret ファイルから読む)。
+#
+# ビルド例(CPU/GPU どちらのビルド機でも可):
+#   DOCKER_BUILDKIT=1 docker build -f Dockerfile.eval \
+#     -t <registry>/bfcl-eval:latest .
+#   コンテナ内マージも要るなら: --build-arg WITH_VERL=1
+# =============================================================================
+
+# reasoning-parser qwen3 / tool-call-parser hermes に対応する vLLM を選ぶ。
+# タグはバージョン依存(qwen3 reasoning parser 対応版を指定)。
+ARG VLLM_TAG=v0.8.5.post1
+FROM vllm/vllm-openai:${VLLM_TAG}
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    HF_HUB_ENABLE_HF_TRANSFER=1
+
+# --- OS パッケージ(health 用 curl、コード取得用 git)------------------------
+RUN set -e; \
+    apt-get update && apt-get install -y --no-install-recommends \
+        git curl ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+# --- Python 依存 -------------------------------------------------------------
+# ベンチ本体(公式)は subprocess で呼ぶため pip 導入。バージョンは要確認。
+# openai / pyyaml は評価スクリプトが使用(base にあれば no-op)。
+ARG TAU_BENCH_SPEC="git+https://github.com/sierra-research/tau-bench.git"
+ARG TAU2_BENCH_SPEC=""
+RUN set -e; \
+    pip install --upgrade pip && \
+    pip install "huggingface_hub[hf_transfer]" hf_transfer openai pyyaml && \
+    if [ -n "${TAU_BENCH_SPEC}" ]; then pip install "${TAU_BENCH_SPEC}" || \
+        echo "WARN: tau-bench 導入失敗。実行時に TAU_RUN_CMD で差し替え可。"; fi && \
+    if [ -n "${TAU2_BENCH_SPEC}" ]; then pip install "${TAU2_BENCH_SPEC}" || \
+        echo "WARN: tau2-bench 導入失敗。"; fi
+
+# --- 任意: コンテナ内マージ用に verl を入れる(既定 OFF)---------------------
+# WITH_VERL=1 のときだけ verl を導入(FSDP checkpoint のマージに必要)。
+ARG WITH_VERL=0
+ARG VERL_VERSION=0.4.1
+RUN set -e; \
+    if [ "${WITH_VERL}" = "1" ]; then pip install "verl==${VERL_VERSION}"; fi
+
+# --- 実行時の既定値(DOK パネルで上書き可能)-------------------------------
+ENV CODE_REPO="" \
+    CODE_REF="main" \
+    CODE_DIR=/workspace/code \
+    MERGED_DIR=/workspace/merged/current \
+    MERGE=0 \
+    MERGED_MODEL_REPO="" \
+    CKPT_MODEL_REPO="" \
+    PHASES="phase0" \
+    SERVED_NAME="qwen3-8b-bfcl" \
+    PORT=8000 \
+    MAX_MODEL_LEN=16384 \
+    GPU_UTIL=0.90 \
+    TP_SIZE=1 \
+    TOOL_CALL_PARSER=hermes \
+    REASONING_PARSER=qwen3 \
+    HEALTH_TIMEOUT=1200
+
+WORKDIR /workspace
+
+# 評価 bootstrap のみ焼く(評価コード本体は実行時 git clone)。
+COPY eval/entrypoint_eval.sh /workspace/entrypoint_eval.sh
+RUN chmod +x /workspace/entrypoint_eval.sh
+
+# vLLM ベースイメージは ENTRYPOINT が API サーバなので上書きする。
+# デバッグ時は DOK 側で bash に差し替え可能。
+ENTRYPOINT ["/workspace/entrypoint_eval.sh"]

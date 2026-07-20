@@ -1,0 +1,27 @@
+# verl main_ppo 用ベース config。CLI override が上に乗る。
+# GSM8K multiturn の例をベースに BFCL 用に最小構成。
+# 実際の全既定値は verl の ppo_trainer.yaml を継承するため、
+# ここでは defaults で ppo_trainer を読み、差分のみ書く。
+# --config-path はプロジェクト直下を指すため、verl 同梱 config を
+# searchpath で解決できるようにする(これが無いと ppo_trainer が見つからない)。
+hydra:
+  searchpath:
+    - pkg://verl.trainer.config
+
+defaults:
+  - ppo_trainer            # verl 同梱の既定 config を継承
+  - _self_
+
+data:
+  return_raw_chat: True
+  # BFCL の会話は interaction_kwargs / extra_info を non_tensor_batch に載せる
+  # (bfcl_dataset_and_interaction.build_verl_dataset が出力する行構造)
+
+actor_rollout_ref:
+  rollout:
+    name: sglang
+    multi_turn:
+      enable: True
+      # Qwen3 の think を保持する(production ミスマッチより think 必須を優先)
+      use_inference_chat_template: False
+      format: hermes

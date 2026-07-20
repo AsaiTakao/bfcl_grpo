@@ -1,0 +1,5 @@
+# BFCL のユーザー役(事前定義発話を順に供給)を登録する設定。
+# actor_rollout_ref.rollout.multi_turn.interaction_config_path にこのパスを指定。
+interaction:
+  - class_name: "bfcl_dataset_and_interaction.BFCLInteraction"
+    config: {}
