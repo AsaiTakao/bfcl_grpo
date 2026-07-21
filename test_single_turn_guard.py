@@ -24,6 +24,7 @@ import unittest
 
 import ast_match
 import train_monitor
+from bfcl_dataset_and_interaction import available_categories as di_available
 
 
 # --------------------------------------------------------------- ast_match
@@ -375,6 +376,37 @@ class VersionPrefixTest(unittest.TestCase):
             di.detect_version_prefix(os.path.join(self.tmp.name, "nope")),
             di.VERSION_PREFIX,
         )
+
+    def test_v3_name_aliases_to_v4_on_load(self) -> None:
+        import json
+        import prepare_bfcl_data as prep
+
+        # v4 環境で旧名 "simple" を指定しても simple_python を読む。
+        # 黙って 400 件を取り逃すのを防ぐ。
+        os.makedirs(os.path.join(self.tmp.name, "possible_answer"))
+        q = [{"id": "simple_0", "question": [[{"role": "user", "content": "a"}]],
+              "function": [{"name": "f", "description": "",
+                            "parameters": {"properties": {}}}]}]
+        a = [{"id": "simple_0", "ground_truth": [{"f": {}}]}]
+        with open(os.path.join(self.tmp.name, "BFCL_v4_simple_python.json"),
+                  "w", encoding="utf-8") as fh:
+            json.dump(q, fh)
+        with open(os.path.join(self.tmp.name, "possible_answer",
+                               "BFCL_v4_simple_python.json"), "w",
+                  encoding="utf-8") as fh:
+            json.dump(a, fh)
+
+        rows = prep._load("simple", self.tmp.name, "BFCL_v4")
+        self.assertEqual(len(rows), 1)
+
+    def test_existing_category_is_not_aliased(self) -> None:
+        import prepare_bfcl_data as prep
+
+        # 実在するカテゴリ名は読み替えない(v3 環境で simple はそのまま)。
+        self._touch("BFCL_v3_simple.json")
+        self.assertIn("simple", di_available(self.tmp.name, "BFCL_v3"))
+        rows = prep._load("simple", self.tmp.name, "BFCL_v3")
+        self.assertEqual(rows, [])   # 中身は空 JSON なので 0 件(読み替えは起きない)
 
     def test_available_categories_listed(self) -> None:
         import bfcl_dataset_and_interaction as di

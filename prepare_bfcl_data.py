@@ -33,14 +33,33 @@ import bfcl_dataset_and_interaction as di
 # ユニットテストできるよう、import は main() 内に遅延させる。
 
 
+# BFCL のバージョン間でのカテゴリ改称。v4 で simple は言語別に分割された。
+# 旧名のまま指定されたとき黙って取り逃さないよう、代替名へ読み替える。
+# java / javascript は AST の値表現が Python 系と異なり ast_match が誤判定する
+# ため、simple の読み替え先は simple_python のみとする。
+_CATEGORY_ALIASES = {
+    "simple": ["simple_python"],
+}
+
+
 def _load(categories: str, bfcl_data_dir: str, prefix: str) -> list:
     """カンマ区切りのカテゴリ名から行を集める。読めないカテゴリは警告して飛ばす。"""
     rows = []
     missing = []
+    available = set(di.available_categories(bfcl_data_dir, prefix))
     for cat in categories.split(","):
         cat = cat.strip()
         if not cat:
             continue
+
+        # 旧名が使えない場合だけ、この BFCL バージョンでの相当カテゴリへ読み替える。
+        if cat not in available:
+            alias = next((a for a in _CATEGORY_ALIASES.get(cat, [])
+                          if a in available), None)
+            if alias:
+                print(f"[{cat}] は {prefix} に存在しないため {alias} に読み替えます")
+                cat = alias
+
         try:
             got = di.build_verl_dataset(cat, bfcl_data_dir, prefix)
         except (OSError, KeyError, ValueError) as e:
