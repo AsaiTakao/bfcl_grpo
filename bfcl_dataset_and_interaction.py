@@ -106,8 +106,21 @@ def _turn_user_text(turn: Any) -> str:
     return ""
 
 
+def is_multi_turn_category(category: str) -> bool:
+    """multi_turn 系(状態ベース採点)か、シングルターン系(AST 採点)かを判定する。"""
+    return category.startswith("multi_turn")
+
+
 def build_verl_dataset(category: str, bfcl_data_dir: str) -> List[dict]:
-    """指定カテゴリの verl 行 list を返す。prepare_bfcl_data.py から呼ばれる。"""
+    """指定カテゴリの verl 行 list を返す。prepare_bfcl_data.py から呼ばれる。
+
+    multi_turn 系は状態ベース採点、それ以外(simple / multiple / parallel / live_*)は
+    AST 採点の行を作る。どちらも同じラッパツール(TOOL_NAME)を使うため、
+    モデルから見た出力フォーマットは 1 つに保たれる。
+    """
+    if not is_multi_turn_category(category):
+        return _build_single_turn_dataset(category, bfcl_data_dir)
+
     q_path = os.path.join(bfcl_data_dir, f"{VERSION_PREFIX}_{category}.json")
     a_path = os.path.join(
         bfcl_data_dir, "possible_answer", f"{VERSION_PREFIX}_{category}.json"
@@ -134,6 +147,7 @@ def build_verl_dataset(category: str, bfcl_data_dir: str) -> List[dict]:
         ]
 
         create_kwargs = {
+            "mode": "state",             # 状態ベース採点(BFCLMultiTurnTool が分岐)
             "involved_classes": involved,
             "initial_config": initial_config,
             "ground_truth": gt,
@@ -156,6 +170,78 @@ def build_verl_dataset(category: str, bfcl_data_dir: str) -> List[dict]:
                     "interaction_kwargs": {
                         "name": INTERACTION_NAME,
                         "user_turns": remaining_turns,
+                        "id": eid,
+                    },
+                },
+            }
+        )
+    return rows
+
+
+def _build_single_turn_dataset(category: str, bfcl_data_dir: str) -> List[dict]:
+    """シングルターン(AST 採点)カテゴリの verl 行 list を返す。
+
+    multi_turn との違い:
+      - 関数 schema は involved_classes ではなくエントリ内の "function" に入っている
+        (実行可能な実装は存在せず、schema だけが与えられる架空 API)。
+      - possible_answer は状態ではなく期待呼び出しの AST
+        ([{"func_name": {"arg": [許容値, ...]}}, ...])。
+      - user 発話は 1 ターンのみ → interaction_kwargs.user_turns は空。
+
+    シングルターンを学習/検証に混ぜる狙いは、multi_turn 特化 RL による
+    既存のシングルターン function calling 能力の退行(破滅的忘却)を
+    抑制・検知すること。
+    """
+    q_path = os.path.join(bfcl_data_dir, f"{VERSION_PREFIX}_{category}.json")
+    a_path = os.path.join(
+        bfcl_data_dir, "possible_answer", f"{VERSION_PREFIX}_{category}.json"
+    )
+    questions = _read_json_or_jsonl(q_path)
+    answers = {a["id"]: a for a in _read_json_or_jsonl(a_path)}
+
+    rows: List[dict] = []
+    for entry in questions:
+        eid = entry["id"]
+        turns = entry.get("question", [])
+        func_docs = entry.get("function", []) or []
+        if isinstance(func_docs, dict):      # 単一関数が dict で来る版に耐える
+            func_docs = [func_docs]
+
+        gt = answers.get(eid, {}).get("ground_truth", [])
+        if not gt:
+            # 正解が引けないエントリは報酬が常に 0 になるので学習に混ぜない。
+            continue
+
+        first_user = _turn_user_text(turns[0]) if turns else ""
+        if not first_user:
+            continue
+
+        prompt = [
+            {"role": "system", "content": _system_prompt(func_docs)},
+            {"role": "user", "content": first_user},
+        ]
+
+        create_kwargs = {
+            "mode": "ast",               # AST 採点(BFCLMultiTurnTool が分岐)
+            "ast_ground_truth": gt,
+            "id": eid,
+        }
+        rows.append(
+            {
+                "data_source": "bfcl_single_turn",   # val 指標を MT と分離するため別名
+                "prompt": prompt,
+                "ability": "tool_use",
+                "reward_model": {"style": "rule", "ground_truth": json.dumps(gt)},
+                "extra_info": {
+                    "index": eid,
+                    "category": category,
+                    "need_tools_kwargs": True,
+                    "tools_kwargs": {
+                        TOOL_NAME: {"create_kwargs": create_kwargs},
+                    },
+                    "interaction_kwargs": {
+                        "name": INTERACTION_NAME,
+                        "user_turns": [],     # 追加の user 発話は無い(1 ターン)
                         "id": eid,
                     },
                 },
@@ -214,4 +300,4 @@ class BFCLInteraction(BaseInteraction):
         self._state.pop(instance_id, None)
 
 
-__all__ = ["build_verl_dataset", "BFCLInteraction"]
+__all__ = ["build_verl_dataset", "is_multi_turn_category", "BFCLInteraction"]

@@ -36,10 +36,14 @@ MAX_PROMPT_LEN="${MAX_PROMPT_LEN:-4096}"          # 初期 config。long_context
 MAX_RESPONSE_LEN="${MAX_RESPONSE_LEN:-2048}"      # 1ターンの think+tool_call 長
 GROUP_SIZE="${GROUP_SIZE:-8}"                     # GRPO の G。H100 x8 なら 8〜16 可
 # 学習スケジュール(env 上書き可)。
+# 総 step 数は小さい: BFCL multi_turn 3 カテゴリ = 600 件、val 10% を引いて
+# train 540 件。TRAIN_BATCH=128 なら 4 step/epoch × 15 epoch ≒ 60 step。
+# save/test の間隔はこの総 step 数を基準に決める(200/50 では eval が 1 回しか
+# 走らず EarlyStopping の patience に到達せず、checkpoint も 1 つも残らない)。
 LR="${LR:-1e-6}"
 TOTAL_EPOCHS="${TOTAL_EPOCHS:-15}"
-SAVE_FREQ="${SAVE_FREQ:-200}"                     # 200 step ごと(HF upload と揃える)
-TEST_FREQ="${TEST_FREQ:-50}"
+SAVE_FREQ="${SAVE_FREQ:-10}"                      # ≒6 CP(HF upload の UPLOAD_EVERY と揃える)
+TEST_FREQ="${TEST_FREQ:-5}"                       # ≒12 回 eval。patience=3 が機能する粒度
 
 # --- FP8 rollout(設計書: rollout-only FP8)---------------------------------
 # 学習側(FSDP actor)は bf16 のまま、sglang 推論エンジンのみ FP8 量子化する。

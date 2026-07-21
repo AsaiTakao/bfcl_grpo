@@ -10,11 +10,21 @@ bfcl_tool_config.yaml で
 モデルは 1 ターンで `tool_calls: [{name, arguments}, ...]` を渡し、
 本ツールがそれらを BFCL バックエンド上で実行して observation を返す。
 
-報酬(mt_reward の二層報酬):
+create_kwargs の "mode" で 2 系統を切り替える(データ側が指定):
+  mode="state" : multi_turn。実バックエンド上で実行し、最終状態を GT と比較。
+  mode="ast"   : シングルターン(simple/multiple/parallel/live_*)。実行可能な
+                 実装が無いため、予測呼び出しを ast_match で GT と照合する。
+                 multi_turn 特化 RL による既存能力の退行を抑える目的で混ぜる。
+
+報酬:
+  mode="state" (mt_reward の二層報酬)
   - execute(): そのターンの process 報酬(実行成立率)を即時値として返す。
   - calc_reward(): GT を実行して最終状態を比較 → outcome。
                    process 履歴 + outcome を mt_reward で結合し、
                    トラジェクトリのスカラ報酬を返す。
+  mode="ast"
+  - execute(): 呼び出しを記録するだけ(observation に正解のヒントは出さない)。
+  - calc_reward(): ast_match.match_score による一致率 [0,1]。
 
 verl の BaseTool import はバージョン差に備えて defensive に行う。
 """
@@ -25,6 +35,7 @@ import os
 from typing import Any, Dict, List, Optional, Tuple
 from uuid import uuid4
 
+import ast_match
 import bfcl_backend as backend
 from mt_reward import RewardConfig, trajectory_reward
 
@@ -64,6 +75,20 @@ class BFCLMultiTurnTool(BaseTool):
     async def create(self, instance_id: Optional[str] = None, **kwargs) -> str:
         """test_entry のコンテキスト(create_kwargs 由来)で BFCL バックエンドを初期化。"""
         instance_id = instance_id or str(uuid4())
+        mode = kwargs.get("mode") or "state"
+
+        if mode == "ast":
+            # シングルターン(AST 採点)。実行可能なバックエンドは存在しないため
+            # インスタンスは作らず、予測呼び出しを溜めて calc_reward で照合する。
+            self._sessions[instance_id] = {
+                "mode": "ast",
+                "ast_ground_truth": kwargs.get("ast_ground_truth", []) or [],
+                "predicted_calls": [],
+                "process_rewards": [],
+                "step": self._current_step(kwargs.get("global_step")),
+            }
+            return instance_id
+
         involved = kwargs.get("involved_classes", []) or []
         initial_config = kwargs.get("initial_config", {}) or {}
         ground_truth = kwargs.get("ground_truth", []) or []
@@ -73,6 +98,7 @@ class BFCLMultiTurnTool(BaseTool):
             involved, initial_config, long_context=long_context
         )
         self._sessions[instance_id] = {
+            "mode": "state",
             "involved": involved,
             "initial_config": initial_config,
             "ground_truth": ground_truth,       # per-turn list[list[str]]
@@ -103,6 +129,20 @@ class BFCLMultiTurnTool(BaseTool):
                 {"n_calls": 0, "n_ok": 0},
             )
 
+        if sess["mode"] == "ast":
+            # 実行系が無いので照合用に記録するだけ。observation は「受理した」ことを
+            # 返すに留め、正解のヒントは一切与えない(報酬 hacking を防ぐ)。
+            sess["predicted_calls"].extend(tool_calls)
+            # 形式として成立した呼び出しであれば process 報酬 1.0
+            # (正誤は calc_reward の AST 照合で評価する)。
+            sess["process_rewards"].append(1.0)
+            names = ", ".join(str(c.get("name", "?")) for c in tool_calls)
+            return (
+                f"[ok] {len(tool_calls)} 件の呼び出しを受理しました: {names}",
+                1.0,
+                {"n_calls": len(tool_calls), "mode": "ast"},
+            )
+
         ns = sess["namespace"]
         outputs: List[str] = []
         n_ok = 0
@@ -131,6 +171,16 @@ class BFCLMultiTurnTool(BaseTool):
         sess = self._sessions.get(instance_id)
         if sess is None:
             return 0.0
+
+        if sess["mode"] == "ast":
+            # シングルターンは AST 一致率をそのまま [0,1] の報酬とする。
+            # multi_turn の二層報酬とはスケールが違うが、GRPO の advantage は
+            # 同一プロンプトの group 内で正規化されるため混在して問題ない。
+            return float(
+                ast_match.match_score(
+                    sess["predicted_calls"], sess["ast_ground_truth"]
+                )
+            )
 
         outcome = self._compute_outcome(sess)
         step = self._current_step(kwargs.get("global_step"), sess.get("step", 0))

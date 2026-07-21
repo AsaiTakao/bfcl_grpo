@@ -29,6 +29,19 @@ verl console 出力の想定形式(Tracking logger=console):
   EARLY_STOP           1 で早期終了を有効(既定 1)
   EARLY_STOP_PATIENCE  改善なし許容回数(既定 3)
   MONITOR_POLL_SECONDS tail の polling 間隔秒(既定 5)
+
+既存能力(シングルターン)の退行ガード:
+  val にシングルターン行を混ぜると verl は data_source 別に val 指標を出す。
+  主指標(multi_turn)にシングルターンの退行ペナルティを合成した combined score で
+  EarlyStopping と最良 CP 選定を行う。
+    combined = mt + w * min(0, st - st_baseline * (1 - tol))
+  マルチターン精度の向上が主目的なので、シングルターンは「下がったら減点」
+  のみで、上がっても加点しない。
+  MT_METRIC_KEY        主指標キーに含まれる部分文字列(既定 "multi_turn")
+  ST_METRIC_KEY        シングルターン指標キーの部分文字列(既定 "single_turn")
+  ST_REGRESSION_WEIGHT ペナルティ係数 w(既定 1.0。mt と st はスケールが違うので
+                       初回の実ログの値域を見て要調整)
+  ST_REGRESSION_TOL    許容する低下率 tol(既定 0.05 = 5% までは減点しない)
 """
 from __future__ import annotations
 
@@ -77,6 +90,17 @@ class TrainMonitor:
         self.step_path = os.path.join(ckpt_dir, "global_step.txt")
         self.marker_path = os.path.join(ckpt_dir, "early_stopped.json")
 
+        # 既存能力(シングルターン)の退行ガード。
+        # val に single_turn の行が混ざっていると verl は data_source 別に
+        # val 指標を出すため、それを拾って主指標へペナルティとして合成する。
+        self.mt_key_sub = _env("MT_METRIC_KEY", "multi_turn")
+        self.st_key_sub = _env("ST_METRIC_KEY", "single_turn")
+        self.st_weight = float(_env("ST_REGRESSION_WEIGHT", "1.0"))
+        self.st_tol = float(_env("ST_REGRESSION_TOL", "0.05"))
+        self.st_key: Optional[str] = None
+        self.st_baseline: Optional[float] = None
+        self._warned_no_st = False
+
         self.chosen_key: Optional[str] = None  # 一度選んだ指標キーに固定する
         self.best_value: Optional[float] = None
         self.best_step: int = -1
@@ -95,7 +119,12 @@ class TrainMonitor:
             return
         key, value = val
         step = self.last_step if step is None else step
-        self._record_metric(step if step is not None else -1, key, value)
+        step = step if step is not None else -1
+
+        # シングルターン(既存能力)の val 指標があれば退行ガードを掛ける。
+        st_value = self._extract_st_metric(line)
+        combined, detail = self._combine(value, st_value)
+        self._record_metric(step, key, combined, detail)
 
     def _extract_step(self, line: str) -> Optional[int]:
         m = _STEP_RE.search(line)
@@ -122,14 +151,81 @@ class TrainMonitor:
                 continue
         if not candidates:
             return None
+
+        # 主目的はマルチターン。data_source 別に val 指標が出ている場合は
+        # multi_turn 側を主指標にし、single_turn 側は退行ガードへ回す。
+        primary = [c for c in candidates if self.mt_key_sub in c[0]]
+        if not primary:
+            # data_source 別に分かれていない版 = 従来どおり単一指標として扱う。
+            primary = [c for c in candidates if self.st_key_sub not in c[0]] or candidates
+
         if self.chosen_key is None:
             # 最初に見つけたキーへ固定(以後、同じ指標で一貫して比較する)。
-            self.chosen_key = candidates[0][0]
-            log(f"val 指標キーを選択: {self.chosen_key}")
-        for key, value in candidates:
+            self.chosen_key = primary[0][0]
+            log(f"val 主指標キーを選択: {self.chosen_key}")
+        for key, value in primary:
             if key == self.chosen_key:
                 return (key, value)
         return None
+
+    def _extract_st_metric(self, line: str) -> Optional[float]:
+        """シングルターン(既存能力)の val 指標を取り出す。無ければ None。"""
+        if self.custom_re is not None:
+            return None
+        candidates: list[tuple[str, float]] = []
+        for key, raw in _PAIR_RE.findall(line):
+            if "val" not in key or self.st_key_sub not in key:
+                continue
+            if self.metric_key_sub and self.metric_key_sub not in key:
+                continue
+            try:
+                candidates.append((key, float(raw)))
+            except ValueError:
+                continue
+        if not candidates:
+            return None
+        if self.st_key is None:
+            self.st_key = candidates[0][0]
+            log(f"シングルターン退行ガードの指標キーを選択: {self.st_key}")
+        for key, value in candidates:
+            if key == self.st_key:
+                return value
+        return None
+
+    def _combine(self, mt_value: float, st_value: Optional[float]) -> tuple[float, dict]:
+        """主指標(マルチターン)にシングルターン退行ペナルティを掛けた値を返す。
+
+        combined = mt + w * min(0, st - st_baseline * (1 - tol))
+
+        - 目的は「マルチターン精度の向上」なので、伸ばす対象は mt のみ。
+        - シングルターンは baseline(最初の eval = ほぼ素の base model)から
+          tol 以上下がったときだけ減点する。上がっても加点しない
+          (シングルターンを伸ばす方向へ最適化が逸れるのを避ける)。
+        - mt と st はスケールが違う(mt は二層報酬の総和、st は [0,1] の一致率)。
+          w は初回の実ログの値域を見て調整すること。
+        """
+        detail = {"mt": mt_value, "st": st_value}
+        if st_value is None:
+            if not self._warned_no_st:
+                self._warned_no_st = True
+                log("[warn] シングルターンの val 指標が見つかりません。"
+                    "既存能力の退行ガードは無効です(val に single_turn 行が"
+                    "含まれているか、data_source 別の val 指標が出ているか確認)。")
+            return mt_value, detail
+
+        if self.st_baseline is None:
+            self.st_baseline = st_value
+            log(f"シングルターン baseline を確定: {st_value}")
+
+        threshold = self.st_baseline * (1.0 - self.st_tol)
+        drop = min(0.0, st_value - threshold)
+        penalty = self.st_weight * drop
+        detail.update({"st_baseline": self.st_baseline, "st_penalty": penalty})
+        if penalty < 0:
+            log(f"[warn] シングルターン退行を検知: st={st_value} < "
+                f"baseline*{1.0 - self.st_tol:.2f}={threshold:.4f} "
+                f"→ penalty={penalty:.4f}")
+        return mt_value + penalty, detail
 
     # ------------------------------------------------------------- 記録と判定
     def _write_step(self, step: int) -> None:
@@ -141,14 +237,20 @@ class TrainMonitor:
         except OSError as e:
             log(f"global_step.txt 書き込み失敗: {e}")
 
-    def _record_metric(self, step: int, key: str, value: float) -> None:
+    def _record_metric(self, step: int, key: str, value: float,
+                       detail: Optional[dict] = None) -> None:
+        # value は退行ガード込みの combined score。hf_checkpoint_uploader は
+        # この value の最大で「最良 CP」を選ぶため、シングルターンが退行した
+        # CP は自動的に選ばれにくくなる。内訳は mt/st フィールドに残す。
         rec = {"step": step, "key": key, "value": value, "ts": time.time()}
+        if detail:
+            rec.update({k: v for k, v in detail.items() if v is not None})
         try:
             with open(self.metrics_path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(rec, ensure_ascii=False) + "\n")
         except OSError as e:
             log(f"val_metrics.jsonl 追記失敗: {e}")
-        log(f"val step={step} {key}={value}")
+        log(f"val step={step} {key}={value} detail={detail}")
 
         # EarlyStopping(大きいほど良い指標を前提: reward / pass 率)。
         if self.best_value is None or value > self.best_value:

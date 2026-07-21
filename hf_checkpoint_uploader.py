@@ -29,7 +29,7 @@ repo 内レイアウト(HF_REPO_ID 直下):
   CKPT_DIR        verl の default_local_dir(global_step_* が並ぶ場所)
   HF_REPO_ID      アップロード先 repo(例: user/qwen3-8b-bfcl-mt-grpo)
   HF_CKPT_PREFIX  repo 内 checkpoint 置き場(既定 checkpoints)
-  UPLOAD_EVERY    アップロード間隔 step(既定 200)
+  UPLOAD_EVERY    アップロード間隔 step(既定 SAVE_FREQ、それも無ければ 10)
   KEEP_BEST / KEEP_LATEST  保持数(既定 3 / 3)
   POLL_SECONDS    watch の polling 間隔秒(既定 60)
   MERGED_DIR      merged モードの出力先(既定 /workspace/merged/final)
@@ -369,7 +369,10 @@ def main() -> int:
     ap.add_argument("--ckpt-dir", default=_env("CKPT_DIR"))
     ap.add_argument("--repo-id", default=_env("HF_REPO_ID"))
     ap.add_argument("--prefix", default=_env("HF_CKPT_PREFIX", "checkpoints"))
-    ap.add_argument("--every", type=int, default=int(_env("UPLOAD_EVERY", "200")))
+    # SAVE_FREQ の倍数でしか checkpoint は生まれないため、既定は SAVE_FREQ に追従する
+    # (両者がズレると step % every == 0 が一度も成立せず、何も upload されない)。
+    ap.add_argument("--every", type=int,
+                    default=int(_env("UPLOAD_EVERY", _env("SAVE_FREQ", "10"))))
     ap.add_argument("--keep-best", type=int, default=int(_env("KEEP_BEST", "3")))
     ap.add_argument("--keep-latest", type=int, default=int(_env("KEEP_LATEST", "3")))
     ap.add_argument("--poll", type=int, default=int(_env("POLL_SECONDS", "60")))

@@ -33,6 +33,7 @@ BFCL multi_turn ──GRPO(verl/LoRA r=32)──▶ checkpoint ──▶ merge(H
 | `bfcl_verl_tool.py` | verl `BaseTool`(`BFCLMultiTurnTool`) |
 | `bfcl_backend.py` | BFCL バックエンドクラスの動的ロード/実行/状態比較 |
 | `mt_reward.py` | 二層報酬(process × λ(step) + outcome × γ 後方伝播) |
+| `ast_match.py` | シングルターン(simple/multiple/parallel/live_*)の AST 照合採点 |
 | `bfcl_multiturn_grpo.yaml` / `bfcl_tool_config.yaml` / `bfcl_interaction_config.yaml` | verl 設定 |
 | `run_bfcl_grpo_h100x8.sh` | 学習起動(env 駆動、LoRA r=32、FP8 rollout トグル、resume_mode=auto) |
 | `train_monitor.py` | train.log 監視: val 指標抽出・EarlyStopping(patience=3)・λ 減衰用 step 供給 |
@@ -47,13 +48,71 @@ BFCL multi_turn ──GRPO(verl/LoRA r=32)──▶ checkpoint ──▶ merge(H
 
 ### データ準備
 DOK 起動時は `entrypoint.sh` が **parquet が無ければ自動生成**する
-(`BFCL_CATEGORIES` 環境変数で対象カテゴリを上書き可能)。手動で行う場合:
+(`BFCL_CATEGORIES` / `BFCL_ST_CATEGORIES` 環境変数で対象カテゴリを上書き可能)。
+手動で行う場合:
 ```bash
 python prepare_bfcl_data.py \
   --bfcl-data-dir "$(python -c "import bfcl_eval,os;print(os.path.join(os.path.dirname(bfcl_eval.__file__),'data'))")" \
   --out-dir ./data \
-  --categories multi_turn_base,multi_turn_miss_func,multi_turn_miss_param
+  --categories multi_turn_base,multi_turn_miss_func,multi_turn_miss_param \
+  --st-categories simple,multiple,parallel,live_simple \
+  --holdout-classes TravelAPI,VehicleControlAPI
 ```
+
+### 汎化を測るための分割(API クラス単位の holdout)
+BFCL multi_turn の舞台となるバックエンドクラスは **8 個しかない**
+(`bfcl_backend.py` の `CLASS_FILE_PATH_MAPPING`)。さらに `miss_func` /
+`miss_param` は `base` の派生なので、600 エントリの実効的な多様性は
+「8 API × 約 200 シナリオ」でしかない。
+
+ここでランダム分割すると **val は train と同じ API を使う**ため、測れるのは
+「同じ API の未知シナリオ」だけ。しかし最終評価の τ-bench retail/airline は
+完全に別ドメインであり、本当に知りたいのは**未知 API への汎化(OOD 転移)**。
+
+`--holdout-classes` は指定クラスを含む行を丸ごと val 側へ寄せる
+(1 エントリが複数クラスにまたがる場合、リークを避けるため val 側に送る)。
+これで val 指標がそのまま OOD 転移の指標になり、EarlyStopping と最良 CP 選定も
+汎化性能で行われる。
+
+- 既定は `HOLDOUT_CLASSES=TravelAPI,VehicleControlAPI`(8 クラス中 2 つ)
+- **トレードオフ**: 8 分の 2 のクラスを train から抜くため、ただでさえ少ない
+  multi_turn の学習データがさらに減る。val 側が 50% を超えると警告が出るので、
+  多すぎる場合はクラスを減らす
+- `HOLDOUT_CLASSES=""` でランダム分割に戻る(その場合も警告が出る)
+- 存在しないクラス名を指定すると起動時に落ちる(typo で val が空のまま
+  学習が走るのを防ぐ)
+
+### マルチターン最適化と既存能力の維持
+主目的はマルチターン精度の向上だが、multi_turn 専用データだけで RL を回すと
+シングルターン function calling が破滅的忘却で壊れる。2 段構えで抑える。
+
+- **train へのリプレイ混入**: シングルターンを `ST_TRAIN_RATIO`(既定 0.3)の
+  割合で混ぜる。これらは実行系を持たないため `ast_match.py` の AST 照合で採点する
+  (`BFCLMultiTurnTool` は `create_kwargs.mode` が `state` / `ast` で分岐)。
+  出力フォーマットは同じラッパツール `bfcl_multi_turn_call` に統一しており、
+  モデルから見た応答形式は 1 つのまま。
+- **val での退行ガード**: val は必ず両系統を含む(層化分割)。`data_source` を
+  `bfcl_multi_turn` / `bfcl_single_turn` に分けてあるので verl が別々に val 指標を
+  出し、`train_monitor.py` が次の combined score にまとめる。
+
+  ```
+  combined = mt + w * min(0, st - st_baseline * (1 - tol))
+  ```
+
+  `st_baseline` は最初の eval(ほぼ素の base model)の値。シングルターンが
+  `tol`(既定 5%)を超えて下がったときだけ減点し、上がっても加点しない
+  (最適化がシングルターン側へ逸れるのを防ぐ)。EarlyStopping と
+  `hf_checkpoint_uploader` の最良 CP 選定はこの combined score を見るため、
+  既存能力を壊した CP は自動的に選ばれにくくなる。
+
+  シングルターンの eval は 1 ターンで終わり multi_turn より大幅に安いので、
+  退行検知のサンプル数は `VAL_ST_SIZE` で増やせる。
+
+  > `ST_REGRESSION_WEIGHT`(既定 1.0)は要調整。`mt` は二層報酬の総和、
+  > `st` は [0,1] の一致率でスケールが違うため、初回の
+  > `checkpoints/val_metrics.jsonl` の `mt` / `st` の実値域を見て決めること。
+
+`BFCL_ST_CATEGORIES=""` で従来のマルチターン専用構成に戻せる。
 
 ### イメージビルド(CPU インスタンス、BuildKit 必須)
 ```bash
@@ -78,8 +137,12 @@ git clone → HF から最新 checkpoint を restore(resume)→ 背景アップ�
   `eval_record.json` に記録される。評価コンテナは
   `MERGED_MODEL_REPO=<HF_REPO_ID>` + `merged-final` をそのまま serve できる。
 
-主な環境変数: `TRAIN_BATCH` `GROUP_SIZE` `LR` `TOTAL_EPOCHS` `SAVE_FREQ`(=200)
-`UPLOAD_EVERY`(=200)`LORA_RANK`(=32、0 でフル FT)`ROLLOUT_FP8`(=0/1)
+主な環境変数: `TRAIN_BATCH` `GROUP_SIZE` `LR` `TOTAL_EPOCHS` `SAVE_FREQ`(=10)
+`TEST_FREQ`(=5)`UPLOAD_EVERY`(=SAVE_FREQ に追従)
+`LORA_RANK`(=32、0 でフル FT)`ROLLOUT_FP8`(=0/1)
+`BFCL_ST_CATEGORIES` `ST_TRAIN_RATIO`(=0.3)`VAL_ST_SIZE`
+`HOLDOUT_CLASSES`(=TravelAPI,VehicleControlAPI)
+`ST_REGRESSION_WEIGHT`(=1.0)`ST_REGRESSION_TOL`(=0.05)
 `EARLY_STOP`/`EARLY_STOP_PATIENCE`(=1/3)`KEEP_BEST`/`KEEP_LATEST`(=3/3)
 `RESUME_FROM_HF`(=1)`MERGE_FINAL`(=1)。
 
