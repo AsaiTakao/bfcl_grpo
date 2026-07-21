@@ -210,12 +210,15 @@ class SingleTurnDatasetTest(unittest.TestCase):
         self.assertEqual(self._rows()[0]["data_source"], "bfcl_single_turn")
 
     def test_row_is_ast_mode_with_no_extra_user_turns(self) -> None:
+        import bfcl_dataset_and_interaction as di
+
         info = self._rows()[0]["extra_info"]
         ck = info["tools_kwargs"]["bfcl_multi_turn_call"]["create_kwargs"]
         self.assertEqual(ck["mode"], "ast")
-        self.assertEqual(ck["ast_ground_truth"],
+        self.assertEqual(di.decode_field(ck["ast_ground_truth"], None),
                          [{"get_weather": {"city": ["Tokyo"]}}])
-        self.assertEqual(info["interaction_kwargs"]["user_turns"], [])
+        self.assertEqual(
+            di.decode_field(info["interaction_kwargs"]["user_turns"], None), [])
 
     def test_prompt_lists_the_entry_function_docs(self) -> None:
         # シングルターンの schema は involved_classes ではなくエントリ内 "function"。
@@ -230,6 +233,103 @@ class SingleTurnDatasetTest(unittest.TestCase):
             json.dump([{"id": "simple_0", "ground_truth": []}], f)
         # 常に報酬 0 になる行を学習に混ぜない。
         self.assertEqual(self._rows(), [])
+
+
+# ---------------------------------------------------------------- parquet
+class ParquetSchemaTest(unittest.TestCase):
+    """parquet に載る形かどうかを固定する。
+
+    なぜ: initial_config はバックエンドクラスごとに、ast_ground_truth は
+    関数名がキーになるため行ごとに構造が変わる。そのまま DataFrame に入れると
+    pyarrow が単一スキーマに落とせず
+    "cannot mix list and non-list, non-null values" で落ちる。
+    自由形式の値は JSON 文字列にし、両モードでキー構成を揃える。
+    """
+
+    def setUp(self) -> None:
+        import json
+
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        os.makedirs(os.path.join(self.tmp.name, "possible_answer"))
+
+        # multi_turn: initial_config がクラスごとに違う構造を持つ 2 件。
+        mt_q = [
+            {"id": "multi_turn_base_0",
+             "question": [[{"role": "user", "content": "a"}],
+                          [{"role": "user", "content": "b"}]],
+             "involved_classes": ["GorillaFileSystem"],
+             "initial_config": {"GorillaFileSystem": {"root": {"f": {}}}}},
+            {"id": "multi_turn_base_1",
+             "question": [[{"role": "user", "content": "c"}]],
+             "involved_classes": ["TradingBot"],
+             "initial_config": {"TradingBot": {"balance": 100, "orders": []}}},
+        ]
+        mt_a = [{"id": "multi_turn_base_0", "ground_truth": [["f(a=1)"], ["g()"]]},
+                {"id": "multi_turn_base_1", "ground_truth": [["h(x=2)"]]}]
+        st_q = [{"id": "simple_0",
+                 "question": [[{"role": "user", "content": "d"}]],
+                 "function": [{"name": "w", "description": "",
+                               "parameters": {"properties": {"c": {}}}}]}]
+        st_a = [{"id": "simple_0", "ground_truth": [{"w": {"c": ["x"]}}]}]
+
+        for name, obj in [("BFCL_v4_multi_turn_base.json", mt_q),
+                          ("BFCL_v4_simple_python.json", st_q)]:
+            with open(os.path.join(self.tmp.name, name), "w", encoding="utf-8") as f:
+                json.dump(obj, f)
+        for name, obj in [("BFCL_v4_multi_turn_base.json", mt_a),
+                          ("BFCL_v4_simple_python.json", st_a)]:
+            with open(os.path.join(self.tmp.name, "possible_answer", name),
+                      "w", encoding="utf-8") as f:
+                json.dump(obj, f)
+
+    def _all_rows(self) -> list:
+        import bfcl_dataset_and_interaction as di
+
+        return (di.build_verl_dataset("multi_turn_base", self.tmp.name)
+                + di.build_verl_dataset("simple_python", self.tmp.name))
+
+    def test_create_kwargs_keys_identical_across_modes(self) -> None:
+        import bfcl_dataset_and_interaction as di
+
+        keysets = {
+            frozenset(r["extra_info"]["tools_kwargs"][di.TOOL_NAME]["create_kwargs"])
+            for r in self._all_rows()
+        }
+        self.assertEqual(len(keysets), 1, f"キー構成が揃っていない: {keysets}")
+
+    def test_free_form_values_are_json_strings(self) -> None:
+        import bfcl_dataset_and_interaction as di
+
+        volatile = ["involved_classes", "initial_config",
+                    "ground_truth", "ast_ground_truth"]
+        for r in self._all_rows():
+            ck = r["extra_info"]["tools_kwargs"][di.TOOL_NAME]["create_kwargs"]
+            for k in volatile:
+                self.assertIsInstance(ck[k], str, f"{k} が文字列でない")
+            self.assertIsInstance(
+                r["extra_info"]["interaction_kwargs"]["user_turns"], str)
+
+    def test_round_trip_restores_structure(self) -> None:
+        import bfcl_dataset_and_interaction as di
+
+        rows = self._all_rows()
+        mt = rows[0]["extra_info"]["tools_kwargs"][di.TOOL_NAME]["create_kwargs"]
+        self.assertEqual(di.decode_field(mt["initial_config"], None),
+                         {"GorillaFileSystem": {"root": {"f": {}}}})
+        self.assertEqual(di.decode_field(mt["ground_truth"], None),
+                         [["f(a=1)"], ["g()"]])
+        self.assertEqual(di.decode_field(mt["involved_classes"], None),
+                         ["GorillaFileSystem"])
+
+    def test_decode_passes_through_raw_structures(self) -> None:
+        import bfcl_dataset_and_interaction as di
+
+        # テストや直接呼び出しでは生の dict/list が来る。両方受け付ける。
+        self.assertEqual(di.decode_field(["a"], None), ["a"])
+        self.assertEqual(di.decode_field(None, []), [])
+        self.assertEqual(di.decode_field("", []), [])
+        self.assertEqual(di.decode_field("not json", []), [])
 
 
 # --------------------------------------------------------------- version

@@ -71,7 +71,8 @@ def _row_classes(row: dict) -> set:
              .get("tools_kwargs", {})
              .get(di.TOOL_NAME, {})
              .get("create_kwargs", {}))
-    return set(ck.get("involved_classes") or [])
+    # involved_classes は parquet 対策で JSON 文字列として持っている。
+    return set(di.decode_field(ck.get("involved_classes"), []))
 
 
 def _split_by_holdout(rows: list, holdout: set) -> tuple:

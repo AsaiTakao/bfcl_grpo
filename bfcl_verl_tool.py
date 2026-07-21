@@ -37,6 +37,7 @@ from uuid import uuid4
 
 import ast_match
 import bfcl_backend as backend
+from bfcl_dataset_and_interaction import decode_field
 from mt_reward import RewardConfig, trajectory_reward
 
 try:  # verl 本体があるとき
@@ -82,16 +83,17 @@ class BFCLMultiTurnTool(BaseTool):
             # インスタンスは作らず、予測呼び出しを溜めて calc_reward で照合する。
             self._sessions[instance_id] = {
                 "mode": "ast",
-                "ast_ground_truth": kwargs.get("ast_ground_truth", []) or [],
+                "ast_ground_truth": decode_field(kwargs.get("ast_ground_truth"), []),
                 "predicted_calls": [],
                 "process_rewards": [],
                 "step": self._current_step(kwargs.get("global_step")),
             }
             return instance_id
 
-        involved = kwargs.get("involved_classes", []) or []
-        initial_config = kwargs.get("initial_config", {}) or {}
-        ground_truth = kwargs.get("ground_truth", []) or []
+        # parquet 経由では自由形式の値が JSON 文字列で届く(encode_field 参照)。
+        involved = decode_field(kwargs.get("involved_classes"), [])
+        initial_config = decode_field(kwargs.get("initial_config"), {})
+        ground_truth = decode_field(kwargs.get("ground_truth"), [])
         long_context = bool(kwargs.get("long_context", False))
 
         instances, namespace = backend.load_involved_classes(

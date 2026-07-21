@@ -143,6 +143,37 @@ def _turn_user_text(turn: Any) -> str:
     return ""
 
 
+def encode_field(value: Any) -> str:
+    """parquet に載せられない自由形式の値を JSON 文字列にする。
+
+    なぜ必要か:
+      initial_config はバックエンドクラスごとに構造が違い、ast_ground_truth は
+      関数名がキーになる。行ごとにスキーマが変わるため pyarrow は単一の struct
+      型に落とせず "cannot mix list and non-list" で落ちる。さらに parquet から
+      読み戻したリストは numpy 配列になり、`x or []` のような真偽評価が
+      例外になる。文字列で持てば両方回避できる。
+    """
+    return json.dumps(value, ensure_ascii=False)
+
+
+def decode_field(value: Any, default: Any) -> Any:
+    """encode_field で書いた値を戻す。既に構造体ならそのまま返す。
+
+    parquet 経由(文字列)と、テストや直接呼び出し(生の dict/list)の
+    両方を受け付ける。
+    """
+    if value is None:
+        return default
+    if isinstance(value, str):
+        if not value:
+            return default
+        try:
+            return json.loads(value)
+        except json.JSONDecodeError:
+            return default
+    return value
+
+
 def is_multi_turn_category(category: str) -> bool:
     """multi_turn 系(状態ベース採点)か、シングルターン系(AST 採点)かを判定する。"""
     return category.startswith("multi_turn")
@@ -187,11 +218,14 @@ def build_verl_dataset(category: str, bfcl_data_dir: str,
             {"role": "user", "content": first_user},
         ]
 
+        # parquet のスキーマを両モードで揃えるため、キー構成は state/ast で共通にし、
+        # 自由形式の値はすべて JSON 文字列で持つ(encode_field の docstring 参照)。
         create_kwargs = {
             "mode": "state",             # 状態ベース採点(BFCLMultiTurnTool が分岐)
-            "involved_classes": involved,
-            "initial_config": initial_config,
-            "ground_truth": gt,
+            "involved_classes": encode_field(involved),
+            "initial_config": encode_field(initial_config),
+            "ground_truth": encode_field(gt),
+            "ast_ground_truth": encode_field([]),
             "long_context": long_context,
             "id": eid,
         }
@@ -210,7 +244,7 @@ def build_verl_dataset(category: str, bfcl_data_dir: str,
                     },
                     "interaction_kwargs": {
                         "name": INTERACTION_NAME,
-                        "user_turns": remaining_turns,
+                        "user_turns": encode_field(remaining_turns),
                         "id": eid,
                     },
                 },
@@ -263,9 +297,14 @@ def _build_single_turn_dataset(category: str, bfcl_data_dir: str,
             {"role": "user", "content": first_user},
         ]
 
+        # キー構成は multi_turn 側と揃える(parquet のスキーマ統一のため)。
         create_kwargs = {
             "mode": "ast",               # AST 採点(BFCLMultiTurnTool が分岐)
-            "ast_ground_truth": gt,
+            "involved_classes": encode_field([]),
+            "initial_config": encode_field({}),
+            "ground_truth": encode_field([]),
+            "ast_ground_truth": encode_field(gt),
+            "long_context": False,
             "id": eid,
         }
         rows.append(
@@ -283,7 +322,8 @@ def _build_single_turn_dataset(category: str, bfcl_data_dir: str,
                     },
                     "interaction_kwargs": {
                         "name": INTERACTION_NAME,
-                        "user_turns": [],     # 追加の user 発話は無い(1 ターン)
+                        # 追加の user 発話は無い(1 ターン)
+                        "user_turns": encode_field([]),
                         "id": eid,
                     },
                 },
@@ -309,7 +349,8 @@ class BFCLInteraction(BaseInteraction):
 
         instance_id = instance_id or str(uuid4())
         self._state[instance_id] = {
-            "user_turns": list(kwargs.get("user_turns", []) or []),
+            # parquet 経由では JSON 文字列で届く(encode_field 参照)。
+            "user_turns": list(decode_field(kwargs.get("user_turns"), [])),
             "idx": 0,
         }
         return instance_id
