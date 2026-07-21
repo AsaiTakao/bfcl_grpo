@@ -33,21 +33,28 @@ import bfcl_dataset_and_interaction as di
 # ユニットテストできるよう、import は main() 内に遅延させる。
 
 
-def _load(categories: str, bfcl_data_dir: str) -> list:
+def _load(categories: str, bfcl_data_dir: str, prefix: str) -> list:
     """カンマ区切りのカテゴリ名から行を集める。読めないカテゴリは警告して飛ばす。"""
     rows = []
+    missing = []
     for cat in categories.split(","):
         cat = cat.strip()
         if not cat:
             continue
         try:
-            got = di.build_verl_dataset(cat, bfcl_data_dir)
+            got = di.build_verl_dataset(cat, bfcl_data_dir, prefix)
         except (OSError, KeyError, ValueError) as e:
             # バージョンによって存在しないカテゴリがあるため、欠損は致命傷にしない。
             print(f"[{cat}] 読み込み失敗のためスキップ: {e}")
+            missing.append(cat)
             continue
         print(f"[{cat}] {len(got)} エントリ")
         rows.extend(got)
+    if missing:
+        # カテゴリ名は BFCL のバージョンで変わる(v4 では simple が
+        # simple_python / simple_java / simple_javascript に分割された)。
+        avail = di.available_categories(bfcl_data_dir, prefix)
+        print(f"[hint] {prefix} で実際に読めるカテゴリ: {avail}")
     return rows
 
 
@@ -94,8 +101,13 @@ def main():
                     default="multi_turn_base,multi_turn_miss_func,multi_turn_miss_param",
                     help="マルチターン(主目的)のカテゴリ")
     ap.add_argument("--st-categories",
-                    default="simple,multiple,parallel,live_simple",
-                    help="シングルターン(既存能力の維持)のカテゴリ。空文字で無効化")
+                    default="simple_python,multiple,parallel,live_simple",
+                    help="シングルターン(既存能力の維持)のカテゴリ。空文字で無効化。"
+                         "simple_java / simple_javascript は AST の値表現が Python 系と"
+                         "異なり ast_match が誤判定するため既定から外している")
+    ap.add_argument("--version-prefix", default="",
+                    help="データファイルの接頭辞(BFCL_v3 / BFCL_v4)。"
+                         "既定は空 = データディレクトリから自動検出")
     ap.add_argument("--val-ratio", type=float, default=0.1)
     ap.add_argument("--holdout-classes", default="",
                     help="val 専用にする BFCL バックエンドクラス名(カンマ区切り)。"
@@ -114,10 +126,19 @@ def main():
     os.makedirs(args.out_dir, exist_ok=True)
     rng = random.Random(args.seed)
 
-    mt_rows = _load(args.categories, args.bfcl_data_dir)
-    st_rows = _load(args.st_categories, args.bfcl_data_dir) if args.st_categories else []
+    prefix = args.version_prefix or di.detect_version_prefix(args.bfcl_data_dir)
+    print(f"BFCL バージョン接頭辞: {prefix}"
+          f"{'(自動検出)' if not args.version_prefix else ''}")
+
+    mt_rows = _load(args.categories, args.bfcl_data_dir, prefix)
+    st_rows = (_load(args.st_categories, args.bfcl_data_dir, prefix)
+               if args.st_categories else [])
     if not mt_rows:
-        raise SystemExit("マルチターンの行が 0 件です。--bfcl-data-dir を確認してください。")
+        raise SystemExit(
+            "マルチターンの行が 0 件です。--bfcl-data-dir と --categories を確認してください。\n"
+            f"  検出した接頭辞: {prefix}\n"
+            f"  読めるカテゴリ: {di.available_categories(args.bfcl_data_dir, prefix)}"
+        )
 
     rng.shuffle(mt_rows)
     rng.shuffle(st_rows)

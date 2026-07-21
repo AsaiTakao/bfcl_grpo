@@ -58,7 +58,7 @@ export PYTHONPATH="${CODE_DIR}:${PYTHONPATH:-}"
 : "${BFCL_CATEGORIES:=multi_turn_base,multi_turn_miss_func,multi_turn_miss_param}"
 # シングルターンを train に混ぜて既存能力の忘却を抑え、val にも入れて退行を検知する。
 # BFCL_ST_CATEGORIES="" で無効化(= 従来のマルチターン専用構成に戻す)。
-: "${BFCL_ST_CATEGORIES:=simple,multiple,parallel,live_simple}"
+: "${BFCL_ST_CATEGORIES:=simple_python,multiple,parallel,live_simple}"
 : "${ST_TRAIN_RATIO:=0.3}"
 : "${VAL_ST_SIZE:=0}"
 # multi_turn の val を API クラス単位で切り出し、未知 API への汎化(OOD 転移)を測る。

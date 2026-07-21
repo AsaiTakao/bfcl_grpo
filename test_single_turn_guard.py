@@ -232,6 +232,62 @@ class SingleTurnDatasetTest(unittest.TestCase):
         self.assertEqual(self._rows(), [])
 
 
+# --------------------------------------------------------------- version
+class VersionPrefixTest(unittest.TestCase):
+    """データファイルの接頭辞検出。
+
+    なぜ: bfcl_eval のバージョンで BFCL_v3_* / BFCL_v4_* とファイル名が変わる。
+    決め打ちにすると全カテゴリが「ファイルなし」で静かにスキップされ、
+    最終的に 0 件で止まるまで原因が分からない。
+    """
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def _touch(self, name: str) -> None:
+        with open(os.path.join(self.tmp.name, name), "w", encoding="utf-8") as f:
+            f.write("[]")
+
+    def test_detects_v4(self) -> None:
+        import bfcl_dataset_and_interaction as di
+
+        self._touch("BFCL_v4_multi_turn_base.json")
+        self.assertEqual(di.detect_version_prefix(self.tmp.name), "BFCL_v4")
+
+    def test_detects_v3(self) -> None:
+        import bfcl_dataset_and_interaction as di
+
+        self._touch("BFCL_v3_multi_turn_base.json")
+        self.assertEqual(di.detect_version_prefix(self.tmp.name), "BFCL_v3")
+
+    def test_prefers_newer_when_mixed(self) -> None:
+        import bfcl_dataset_and_interaction as di
+
+        self._touch("BFCL_v3_simple.json")
+        self._touch("BFCL_v4_simple_python.json")
+        self.assertEqual(di.detect_version_prefix(self.tmp.name), "BFCL_v4")
+
+    def test_missing_dir_falls_back(self) -> None:
+        import bfcl_dataset_and_interaction as di
+
+        self.assertEqual(
+            di.detect_version_prefix(os.path.join(self.tmp.name, "nope")),
+            di.VERSION_PREFIX,
+        )
+
+    def test_available_categories_listed(self) -> None:
+        import bfcl_dataset_and_interaction as di
+
+        self._touch("BFCL_v4_simple_python.json")
+        self._touch("BFCL_v4_multi_turn_base.json")
+        self._touch("BFCL_v3_ignored.json")
+        self.assertEqual(
+            di.available_categories(self.tmp.name, "BFCL_v4"),
+            ["multi_turn_base", "simple_python"],
+        )
+
+
 # ---------------------------------------------------------------- holdout
 class HoldoutSplitTest(unittest.TestCase):
     """API クラス単位の holdout 分割。

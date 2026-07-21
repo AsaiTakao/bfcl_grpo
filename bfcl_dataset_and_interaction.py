@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from typing import Any, Dict, List, Optional, Tuple
 
 try:
@@ -31,9 +32,45 @@ except Exception:  # noqa: BLE001  ローカル単体テスト用フォールバ
             self.name = config.get("name", "bfcl") if isinstance(config, dict) else "bfcl"
 
 
-VERSION_PREFIX = "BFCL_v3"
+VERSION_PREFIX = "BFCL_v3"               # 検出できなかった場合のフォールバック
 TOOL_NAME = "bfcl_multi_turn_call"       # bfcl_tool_config.yaml の function.name と一致
 INTERACTION_NAME = "bfcl"                # interaction_kwargs["name"] と一致させる
+
+_PREFIX_RE = re.compile(r"^(BFCL_v\d+)_.+\.json$")
+
+
+def detect_version_prefix(bfcl_data_dir: str) -> str:
+    """データディレクトリ実物から BFCL_vN プレフィックスを検出する。
+
+    bfcl_eval のバージョンでファイル名が BFCL_v3_* / BFCL_v4_* と変わるため、
+    決め打ちにすると全カテゴリが「ファイルなし」で静かにスキップされる。
+    複数バージョンが混在していれば新しい方を採用する。
+    """
+    found = set()
+    try:
+        for fn in os.listdir(bfcl_data_dir):
+            m = _PREFIX_RE.match(fn)
+            if m:
+                found.add(m.group(1))
+    except OSError:
+        return VERSION_PREFIX
+    if not found:
+        return VERSION_PREFIX
+    return max(found, key=lambda p: int(p.rsplit("v", 1)[1]))
+
+
+def available_categories(bfcl_data_dir: str, version_prefix: str) -> List[str]:
+    """そのディレクトリで実際に読めるカテゴリ名の一覧(エラーメッセージ用)。"""
+    out = []
+    try:
+        entries = os.listdir(bfcl_data_dir)
+    except OSError:
+        return out
+    head = f"{version_prefix}_"
+    for fn in sorted(entries):
+        if fn.startswith(head) and fn.endswith(".json"):
+            out.append(fn[len(head):-len(".json")])
+    return out
 
 
 # ============================================================ データセット構築
@@ -111,19 +148,23 @@ def is_multi_turn_category(category: str) -> bool:
     return category.startswith("multi_turn")
 
 
-def build_verl_dataset(category: str, bfcl_data_dir: str) -> List[dict]:
+def build_verl_dataset(category: str, bfcl_data_dir: str,
+                       version_prefix: Optional[str] = None) -> List[dict]:
     """指定カテゴリの verl 行 list を返す。prepare_bfcl_data.py から呼ばれる。
 
-    multi_turn 系は状態ベース採点、それ以外(simple / multiple / parallel / live_*)は
+    multi_turn 系は状態ベース採点、それ以外(simple_* / multiple / parallel / live_*)は
     AST 採点の行を作る。どちらも同じラッパツール(TOOL_NAME)を使うため、
     モデルから見た出力フォーマットは 1 つに保たれる。
-    """
-    if not is_multi_turn_category(category):
-        return _build_single_turn_dataset(category, bfcl_data_dir)
 
-    q_path = os.path.join(bfcl_data_dir, f"{VERSION_PREFIX}_{category}.json")
+    version_prefix を省略するとデータディレクトリから自動検出する。
+    """
+    prefix = version_prefix or detect_version_prefix(bfcl_data_dir)
+    if not is_multi_turn_category(category):
+        return _build_single_turn_dataset(category, bfcl_data_dir, prefix)
+
+    q_path = os.path.join(bfcl_data_dir, f"{prefix}_{category}.json")
     a_path = os.path.join(
-        bfcl_data_dir, "possible_answer", f"{VERSION_PREFIX}_{category}.json"
+        bfcl_data_dir, "possible_answer", f"{prefix}_{category}.json"
     )
     questions = _read_json_or_jsonl(q_path)
     answers = {a["id"]: a for a in _read_json_or_jsonl(a_path)}
@@ -178,7 +219,8 @@ def build_verl_dataset(category: str, bfcl_data_dir: str) -> List[dict]:
     return rows
 
 
-def _build_single_turn_dataset(category: str, bfcl_data_dir: str) -> List[dict]:
+def _build_single_turn_dataset(category: str, bfcl_data_dir: str,
+                               version_prefix: str) -> List[dict]:
     """シングルターン(AST 採点)カテゴリの verl 行 list を返す。
 
     multi_turn との違い:
@@ -192,9 +234,9 @@ def _build_single_turn_dataset(category: str, bfcl_data_dir: str) -> List[dict]:
     既存のシングルターン function calling 能力の退行(破滅的忘却)を
     抑制・検知すること。
     """
-    q_path = os.path.join(bfcl_data_dir, f"{VERSION_PREFIX}_{category}.json")
+    q_path = os.path.join(bfcl_data_dir, f"{version_prefix}_{category}.json")
     a_path = os.path.join(
-        bfcl_data_dir, "possible_answer", f"{VERSION_PREFIX}_{category}.json"
+        bfcl_data_dir, "possible_answer", f"{version_prefix}_{category}.json"
     )
     questions = _read_json_or_jsonl(q_path)
     answers = {a["id"]: a for a in _read_json_or_jsonl(a_path)}
@@ -300,4 +342,5 @@ class BFCLInteraction(BaseInteraction):
         self._state.pop(instance_id, None)
 
 
-__all__ = ["build_verl_dataset", "is_multi_turn_category", "BFCLInteraction"]
+__all__ = ["build_verl_dataset", "is_multi_turn_category",
+           "detect_version_prefix", "available_categories", "BFCLInteraction"]

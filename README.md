@@ -55,9 +55,16 @@ python prepare_bfcl_data.py \
   --bfcl-data-dir "$(python -c "import bfcl_eval,os;print(os.path.join(os.path.dirname(bfcl_eval.__file__),'data'))")" \
   --out-dir ./data \
   --categories multi_turn_base,multi_turn_miss_func,multi_turn_miss_param \
-  --st-categories simple,multiple,parallel,live_simple \
+  --st-categories simple_python,multiple,parallel,live_simple \
   --holdout-classes TravelAPI,VehicleControlAPI
 ```
+
+データファイルの接頭辞(`BFCL_v3_*` / `BFCL_v4_*`)は**ディレクトリから自動検出**する
+(`--version-prefix` で明示も可)。カテゴリ名はバージョンで変わる点に注意:
+v4 では `simple` が `simple_python` / `simple_java` / `simple_javascript` に分割された。
+`simple_java` / `simple_javascript` は AST の値表現が Python 系と異なり
+`ast_match` が誤判定するため既定から外している。
+指定したカテゴリが読めなかった場合は、実際に読めるカテゴリ一覧が hint として出る。
 
 ### 汎化を測るための分割(API クラス単位の holdout)
 BFCL multi_turn の舞台となるバックエンドクラスは **8 個しかない**
