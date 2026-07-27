@@ -1,0 +1,36 @@
+[project]
+name = "bfcl-grpo"
+version = "0.1.0"
+description = "BFCL multi-turn GRPO training / tau-bench eval pipeline"
+requires-python = ">=3.10"
+# 学習・評価の実行時依存(verl / sglang / vLLM / flash-attn / bfcl-eval /
+# tau-bench 等)は GPU/CUDA 前提のため Docker イメージ側で pip 管理する。
+# ここには「GPU 無しのローカルで単体テストできる範囲」の依存だけを置く。
+dependencies = []
+
+[project.optional-dependencies]
+# 参考: ローカルで data prep / 集計を試す時に使う軽量依存。
+# uv sync --extra tools で追加インストールできる(必須ではない)。
+tools = [
+    "pyyaml>=6.0",
+    "pandas>=2.0",
+]
+
+[dependency-groups]
+# `uv sync` で既定インストールされる開発/テスト依存。
+dev = [
+    "pytest>=8.0",
+    "pyyaml>=6.0",
+    "pandas>=2.0",
+]
+
+[tool.uv]
+# スクリプト集であり配布パッケージではないので build/install しない。
+package = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# リポジトリ直下と eval/ をトップレベル import 対象にする
+# (bfcl_backend, mt_reward, dummy_user, run_tau_eval 等をそのまま import)。
+pythonpath = [".", "eval"]
+addopts = "-ra"

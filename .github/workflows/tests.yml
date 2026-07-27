@@ -1,0 +1,31 @@
+name: tests
+
+# GPU / Docker 不要の純 Python ロジック(報酬計算・ログ監視・集計・
+# dummy user)だけをローカル相当の CPU ランナーで検証する。
+# 学習/評価本体(verl / sglang / vLLM / CUDA)は対象外。
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Set up Python ${{ matrix.python-version }}
+        run: uv python install ${{ matrix.python-version }}
+
+      - name: Sync dependencies
+        run: uv sync --python ${{ matrix.python-version }}
+
+      - name: Run tests
+        run: uv run --python ${{ matrix.python-version }} pytest
