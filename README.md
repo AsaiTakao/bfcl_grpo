@@ -35,7 +35,8 @@ BFCL multi_turn ──GRPO(verl/LoRA r=32)──▶ checkpoint ──▶ merge(H
 | `mt_reward.py` | 二層報酬(process × λ(step) + outcome × γ 後方伝播) |
 | `ast_match.py` | シングルターン(simple/multiple/parallel/live_*)の AST 照合採点 |
 | `bfcl_multiturn_grpo.yaml` / `bfcl_tool_config.yaml` / `bfcl_interaction_config.yaml` | verl 設定 |
-| `run_bfcl_grpo_h100x8.sh` | 学習起動(env 駆動、LoRA r=32、FP8 rollout トグル、resume_mode=auto) |
+| `run_bfcl_grpo_h100x8.sh` | 学習起動(env 駆動、LoRA r=32、resume_mode=auto) |
+| `verl_lora_sglang_patch.py` | sglang へ重みを同期する直前に LoRA を base へマージする verl パッチ |
 | `train_monitor.py` | train.log 監視: val 指標抽出・EarlyStopping(patience=3)・λ 減衰用 step 供給 |
 | `hf_checkpoint_uploader.py` | 200step ごと HF push(最良3+直近3保持)/ resume 復元 / merge 版最終 push |
 | `Dockerfile` / `entrypoint.sh` | 学習イメージ(sglang) |
@@ -146,7 +147,8 @@ git clone → HF から最新 checkpoint を restore(resume)→ 背景アップ�
 
 主な環境変数: `TRAIN_BATCH` `GROUP_SIZE` `LR` `TOTAL_EPOCHS` `SAVE_FREQ`(=10)
 `TEST_FREQ`(=5)`UPLOAD_EVERY`(=SAVE_FREQ に追従)
-`LORA_RANK`(=32、0 でフル FT)`ROLLOUT_FP8`(=0/1)
+`LORA_RANK`(=32、0 でフル FT)`HF_PUSH_CONTENTS`(=lora / full)
+`ACTOR_PARAM_OFFLOAD` / `ACTOR_OPTIM_OFFLOAD`(=False。OOM 時に True)
 `BFCL_ST_CATEGORIES` `ST_TRAIN_RATIO`(=0.3)`VAL_ST_SIZE`
 `HOLDOUT_CLASSES`(=TravelAPI,VehicleControlAPI)
 `ST_REGRESSION_WEIGHT`(=1.0)`ST_REGRESSION_TOL`(=0.05)
@@ -232,10 +234,32 @@ DOCKER_BUILDKIT=1 docker build -f Dockerfile.eval -t <registry>/bfcl-eval:latest
 - **バージョン依存が強い**: verl / sglang / vLLM / bfcl_eval / tau-bench の API と
   CLI はバージョンで変わる。各所に env の逃げ道を用意している
   (`ROLLOUT_EXTRA_ARGS`、`TAU_RUN_CMD`、`REASONING_PARSER=""` など)。
-- **LoRA(r=32)+ sglang rollout** の組合せは verl のバージョン依存が強い
-  (`load_format=safetensors` 要件など)。動かない場合は `LORA_RANK=0` で
-  フル FT に退避できる。merge は `verl.model_merger` →失敗時 peft
+- **LoRA + sglang rollout は verl 0.4.1 単体では動かない**(検証済み)。verl の
+  LoRA 配線は vLLM 経路にしか無く、`fsdp_sglang.py` は PEFT ラップの解除も
+  adapter の merge もせずに `state_dict()` を sglang へ push するため、最初の
+  重み同期で `base_model.model.…lora_A…` のキー不一致で落ちる。
+  そこで `verl_lora_sglang_patch.py` を `actor_rollout_ref.model.external_lib`
+  (各 worker の `init_model()` で import される verl 公式フック)で当て、
+  sglang へ渡す直前に `W += (B @ A) * alpha/r` を行って素の HF キーに戻す。
+  学習側は LoRA のままなので数学的には通常の LoRA 学習と同じ。
+  **未実機検証**: マージ計算とキー変換は `tests/test_lora_sglang_patch.py` で
+  peft の `merge_and_unload()` と一致することまで確認済みだが、FSDP 実環境での
+  メモリ・速度は 8×H100 で要確認(base 重みを一度 full tensor 化するため
+  ピークが ~16GB 増える。足りなければ `gpu_memory_utilization` を下げる)。
+  なお sglang + LoRA は verl 0.8.0 が公式対応しているが、0.8.0 は
+  `interactions` モジュールを削除しており `BFCLInteraction` が載らないため、
+  上げるなら AgentLoop への移植が別途必要。
+  merge は `verl.model_merger` →失敗時 peft
   `merge_and_unload` の 2 段構え(`LORA_MERGE=0` でスキップ)。
+- **HF への checkpoint push は既定で LoRA adapter のみ**(`HF_PUSH_CONTENTS=lora`)。
+  8B のフル checkpoint は FSDP shard + optimizer 状態で ~80GB/個 になり
+  `SAVE_FREQ` ごとの push が現実的でないため。adapter は r=32 で ~200MB。
+  副作用として **HF からの resume は無効**になる(optimizer 状態が無いため)。
+  途中再開が必要なら `HF_PUSH_CONTENTS=full` に戻す。
+- **FP8 rollout(`ROLLOUT_FP8=1`)も verl 0.4.1 では不可**。`SGLangRollout` は
+  AsyncEngine を固定引数で構築し `engine_kwargs.sglang.*` を読まない
+  (config にキー自体が無く hydra override も通らない)。黙って無視されると
+  誤解を招くため、run script 側で明示エラーにしてある。
 - **EarlyStopping / eval 抽出**は verl console logger の
   `step:N - key:value` 形式を前提に train.log を正規表現で読む
   (`train_monitor.py`)。形式が違う場合は `VAL_METRIC_KEY` /

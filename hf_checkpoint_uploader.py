@@ -34,6 +34,9 @@ repo 内レイアウト(HF_REPO_ID 直下):
   POLL_SECONDS    watch の polling 間隔秒(既定 60)
   MERGED_DIR      merged モードの出力先(既定 /workspace/merged/final)
   HF_MERGED_PREFIX merged の repo 内パス(既定 merged-final)
+  HF_PUSH_CONTENTS HF へ上げる中身(既定 lora)。lora=LoRA adapter と
+                  tokenizer/config のみ / full=FSDP shard・optimizer も含む全部。
+                  lora のときは optimizer 状態が無いため HF からの resume は不可。
   HF_TOKEN        書き込みトークン(未指定なら hf のログイン情報を使用)
 """
 from __future__ import annotations
@@ -51,6 +54,12 @@ from typing import Dict, List, Optional, Set, Tuple
 _STEP_RE = re.compile(r"global_step_(\d+)$")
 _LATEST_FILE = "latest_checkpointed_iteration.txt"
 _METRICS_FILE = "val_metrics.jsonl"
+# HF へ上げる中身(HF_PUSH_CONTENTS)。
+#   lora: LoRA adapter + tokenizer/config だけ(r=32 で ~200MB/個)。
+#   full: FSDP shard と optimizer 状態も含む全部(8B フル FT なら ~80GB/個)。
+# verl の checkpoint レイアウトは global_step_N/actor/{model,optim,extra}_world_size_*.pt
+# + huggingface/(config・tokenizer)+ lora_adapter/(LoRA 学習時のみ)。
+_LORA_ONLY_PATTERNS = ["*/lora_adapter/*", "*/huggingface/*"]
 # resume を跨いで学習経過を1本のログに追記し続けるため、train.log も
 # checkpoint と一緒に push/restore する(コンテナ再起動で workspace が
 # 消えても過去分が末尾追記の起点として復元される)。
@@ -157,15 +166,30 @@ def remote_steps(api, repo_id: str, prefix: str) -> Set[int]:
     return steps
 
 
+def has_lora_adapter(step_path: str) -> bool:
+    """checkpoint 内に LoRA adapter があるか(actor/lora_adapter/)。"""
+    for root, dirs, _ in os.walk(step_path):
+        if "lora_adapter" in dirs:
+            return True
+    return False
+
+
 def push_checkpoint(api, repo_id: str, prefix: str, step: int, path: str,
-                    ckpt_dir: str) -> None:
-    """global_step_N を repo へ push し、resume 用メタも同時に上げる。"""
+                    ckpt_dir: str, contents: str = "full") -> None:
+    """global_step_N を repo へ push し、resume 用メタも同時に上げる。
+
+    contents="lora" のときは LoRA adapter と tokenizer/config だけを上げる
+    (FSDP shard と optimizer 状態は上げない = 途中再開はできなくなる)。
+    """
     api.create_repo(repo_id, repo_type="model", exist_ok=True, private=True)
+    allow = _LORA_ONLY_PATTERNS if contents == "lora" else None
     api.upload_folder(
         folder_path=path,
         repo_id=repo_id,
         path_in_repo=f"{prefix}/global_step_{step}",
-        commit_message=f"checkpoint step={step}",
+        allow_patterns=allow,
+        commit_message=f"checkpoint step={step}"
+                       + (" (lora only)" if contents == "lora" else ""),
     )
     for meta in (_LATEST_FILE, _METRICS_FILE, _TRAIN_LOG_FILE):
         mp = os.path.join(ckpt_dir, meta)
@@ -202,9 +226,19 @@ def prune_remote(api, repo_id: str, prefix: str, metrics: List[Dict],
 
 # ----------------------------------------------------------------- 各モード
 def _push_once(api, args, step: int, path: str) -> bool:
-    log(f"push step={step} -> {args.repo_id}/{args.prefix}/global_step_{step}")
+    contents = getattr(args, "contents", "full")
+    if contents == "lora" and not has_lora_adapter(path):
+        # LoRA 学習でなければ adapter は生まれない。ここで full に落とすと
+        # 意図せず 80GB 級を上げてしまうので、上げずに知らせるだけにする。
+        log(f"step={step}: lora_adapter が無いため push をスキップ"
+            f"(HF_PUSH_CONTENTS=lora)。フル checkpoint を上げるなら "
+            f"HF_PUSH_CONTENTS=full を指定してください。")
+        return False
+    log(f"push step={step} [{contents}] -> "
+        f"{args.repo_id}/{args.prefix}/global_step_{step}")
     try:
-        push_checkpoint(api, args.repo_id, args.prefix, step, path, args.ckpt_dir)
+        push_checkpoint(api, args.repo_id, args.prefix, step, path,
+                        args.ckpt_dir, contents=contents)
         prune_remote(api, args.repo_id, args.prefix,
                      load_val_metrics(args.ckpt_dir), args.keep_best, args.keep_latest)
         log(f"done step={step}")
@@ -256,6 +290,14 @@ def mode_final(args, token: Optional[str]) -> int:
 def mode_restore(args, token: Optional[str]) -> int:
     """resume 用: HF 上の最新 checkpoint を CKPT_DIR へ戻す(無ければ何もしない)。"""
     from huggingface_hub import snapshot_download
+
+    if getattr(args, "contents", "full") == "lora":
+        # lora push では FSDP shard / optimizer 状態を上げていないため、
+        # HF 側の checkpoint から verl の学習を再開することはできない。
+        # 中途半端に戻して resume_mode=auto に拾わせると壊れるので何もしない。
+        log("HF_PUSH_CONTENTS=lora のため HF からの resume は行いません"
+            "(adapter のみで optimizer 状態が無いため)。fresh start します。")
+        return 0
 
     api = _api(token)
     steps = remote_steps(api, args.repo_id, args.prefix)
@@ -378,6 +420,10 @@ def main() -> int:
     ap.add_argument("--poll", type=int, default=int(_env("POLL_SECONDS", "60")))
     ap.add_argument("--merged-dir", default=_env("MERGED_DIR", "/workspace/merged/final"))
     ap.add_argument("--merged-prefix", default=_env("HF_MERGED_PREFIX", "merged-final"))
+    ap.add_argument("--contents", choices=["lora", "full"],
+                    default=_env("HF_PUSH_CONTENTS", "lora"),
+                    help="HF へ上げる中身。lora=adapter と tokenizer/config のみ"
+                         "(既定)、full=FSDP shard と optimizer も含む全部。")
     args = ap.parse_args()
 
     if not args.ckpt_dir or not args.repo_id:

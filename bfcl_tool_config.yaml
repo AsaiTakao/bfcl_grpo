@@ -1,5 +1,5 @@
 # BFCL multi_turn を verl BaseTool として登録する設定。
-# actor_rollout_ref.rollout.tool_kwargs.tools_config_file にこのパスを指定する。
+# actor_rollout_ref.rollout.multi_turn.tool_config_path にこのパスを指定する。
 tools:
   - class_name: "bfcl_verl_tool.BFCLMultiTurnTool"
     config:

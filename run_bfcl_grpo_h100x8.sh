@@ -26,6 +26,13 @@ CKPT_DIR="${CKPT_DIR:-${PROJECT_DIR}/checkpoints}"
 # sglang rollout と FSDP 学習は verl が同一 GPU 群で時分割する(colocate)。
 # 8枚を trainer に渡し、rollout の GPU メモリ比率で棲み分ける。
 N_GPUS="${N_GPUS:-8}"
+# rollout エンジン。multi_turn ツール実行は verl 0.4.1 では sglang 前提。
+ROLLOUT_NAME="${ROLLOUT_NAME:-sglang}"
+# OOM 時に env だけで offload へ倒せるようにする(True で step 時間は延びる)。
+# LoRA なら optimizer 状態は小さいが、rollout 同期のマージで base 重みを一度
+# full tensor 化するぶん(8B bf16 ≒ 16GB)ピークが上がる点に注意。
+ACTOR_PARAM_OFFLOAD="${ACTOR_PARAM_OFFLOAD:-False}"
+ACTOR_OPTIM_OFFLOAD="${ACTOR_OPTIM_OFFLOAD:-False}"
 
 # --- バッチ/シーケンス ---
 # multi_turn は 1 rollout が複数生成。長め context に備える。
@@ -60,25 +67,43 @@ ROLLOUT_FP8_KV="${ROLLOUT_FP8_KV:-auto}"
 
 EXTRA_ARGS=()
 if [[ "${ROLLOUT_FP8}" == "1" ]]; then
-  # rollout エンジンへ渡す量子化設定(engine_kwargs.sglang.* は sglang Engine 引数へ写像)。
-  EXTRA_ARGS+=( "actor_rollout_ref.rollout.dtype=bfloat16" )
-  EXTRA_ARGS+=( "actor_rollout_ref.rollout.engine_kwargs.sglang.quantization=${ROLLOUT_FP8_QUANT}" )
-  EXTRA_ARGS+=( "actor_rollout_ref.rollout.engine_kwargs.sglang.kv_cache_dtype=${ROLLOUT_FP8_KV}" )
-  echo "[run] FP8 rollout 有効: quant=${ROLLOUT_FP8_QUANT} kv=${ROLLOUT_FP8_KV}"
+  # verl 0.4.1 の sglang rollout は engine_kwargs.sglang.* を一切読まない
+  # (SGLangRollout が AsyncEngine を固定引数で構築するため。quantization /
+  #  kv_cache_dtype は Engine へ渡らない)。加えて struct モードの config に
+  # 無いキーなので hydra override 自体が ConfigKeyError で落ちる。
+  # 黙って無視されるより明示的に止める。有効化するには verl の更新が要る。
+  echo "[run] ERROR: ROLLOUT_FP8=1 は verl ${VERL_VERSION_HINT:-0.4.1} + sglang では未対応です。" >&2
+  echo "[run]        engine_kwargs.sglang.* は rollout エンジンへ渡らないため、" >&2
+  echo "[run]        FP8 は verl 更新後に対応してください(ROLLOUT_FP8=0 で実行)。" >&2
+  exit 1
 fi
 # --- LoRA(設計書: LoRA r=32)------------------------------------------------
-# actor を LoRA で学習する。LORA_RANK=0 でフル FT に切替可能。
-# rollout エンジンへは adapter を都度同期するため、verl の LoRA 要件として
-# load_format=safetensors を指定する(バージョン依存。要実機確認)。
+# actor を LoRA で学習する。LORA_RANK=0 でフル FT。
+#
+# verl 0.4.1 の LoRA 配線は vLLM 経路にしか無く、sglang 側の
+# FSDPSGLangShardingManager は PEFT ラップも adapter も解かずに state_dict を
+# rollout エンジンへ流してしまう。そこで verl_lora_sglang_patch を
+# external_lib(各 worker の init_model で import される公式フック)で当て、
+# sglang へ渡す直前に LoRA を base へマージする。詳細はパッチ側の docstring。
 LORA_RANK="${LORA_RANK:-32}"
 LORA_ALPHA="${LORA_ALPHA:-32}"
 LORA_TARGETS="${LORA_TARGETS:-all-linear}"
+LORA_PATCH_MODULE="${LORA_PATCH_MODULE:-verl_lora_sglang_patch}"
 if [[ "${LORA_RANK}" != "0" ]]; then
   EXTRA_ARGS+=( "actor_rollout_ref.model.lora_rank=${LORA_RANK}" )
   EXTRA_ARGS+=( "actor_rollout_ref.model.lora_alpha=${LORA_ALPHA}" )
   EXTRA_ARGS+=( "actor_rollout_ref.model.target_modules=${LORA_TARGETS}" )
-  EXTRA_ARGS+=( "actor_rollout_ref.rollout.load_format=safetensors" )
+  if [[ "${ROLLOUT_NAME}" == "sglang" ]]; then
+    # PYTHONPATH に PROJECT_DIR が入っているので module 名で import できる。
+    EXTRA_ARGS+=( "actor_rollout_ref.model.external_lib=${LORA_PATCH_MODULE}" )
+    echo "[run] sglang 向け LoRA マージパッチを external_lib で適用: ${LORA_PATCH_MODULE}"
+  else
+    # vLLM 経路は verl 本体が adapter を engine へ渡す。その要件。
+    EXTRA_ARGS+=( "actor_rollout_ref.rollout.load_format=safetensors" )
+  fi
   echo "[run] LoRA 有効: r=${LORA_RANK} alpha=${LORA_ALPHA} targets=${LORA_TARGETS}"
+else
+  echo "[run] LoRA 無効: フル FT で学習します。"
 fi
 
 # バージョン差でキー名が違う場合の逃げ道(例: ROLLOUT_EXTRA_ARGS="a.b=c d.e=f")。
@@ -107,9 +132,9 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.use_kl_loss=True \
     actor_rollout_ref.actor.kl_loss_coef=0.001 \
     actor_rollout_ref.actor.kl_loss_type=low_var_kl \
-    actor_rollout_ref.actor.fsdp_config.param_offload=False \
-    actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
-    actor_rollout_ref.rollout.name=sglang \
+    actor_rollout_ref.actor.fsdp_config.param_offload=${ACTOR_PARAM_OFFLOAD} \
+    actor_rollout_ref.actor.fsdp_config.optimizer_offload=${ACTOR_OPTIM_OFFLOAD} \
+    actor_rollout_ref.rollout.name=${ROLLOUT_NAME} \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.5 \
     actor_rollout_ref.rollout.n=${GROUP_SIZE} \
     actor_rollout_ref.rollout.multi_turn.enable=True \
@@ -118,7 +143,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.multi_turn.format=hermes \
     actor_rollout_ref.rollout.multi_turn.use_inference_chat_template=False \
     actor_rollout_ref.rollout.multi_turn.tokenization_sanity_check_mode=ignore_strippable \
-    actor_rollout_ref.rollout.tool_kwargs.tools_config_file="${TOOL_CONFIG}" \
+    actor_rollout_ref.rollout.multi_turn.tool_config_path="${TOOL_CONFIG}" \
     actor_rollout_ref.rollout.multi_turn.interaction_config_path="${INTERACTION_CONFIG}" \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=8 \

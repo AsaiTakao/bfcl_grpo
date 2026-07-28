@@ -104,6 +104,7 @@ ENV CODE_REPO="" \
     HF_REPO_ID="" \
     HF_CKPT_PREFIX="checkpoints" \
     HF_MERGED_PREFIX="merged-final" \
+    HF_PUSH_CONTENTS="lora" \
     KEEP_BEST=3 \
     KEEP_LATEST=3 \
     RESUME_FROM_HF=1 \

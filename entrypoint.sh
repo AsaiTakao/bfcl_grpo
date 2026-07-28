@@ -117,7 +117,7 @@ fi
 
 UPLOADER_PID=""
 if [[ -n "${HF_REPO_ID:-}" ]]; then
-  log "checkpoint uploader 起動: ${HF_REPO_ID}/${HF_CKPT_PREFIX:-checkpoints} every=${UPLOAD_EVERY:-${SAVE_FREQ:-10}} 保持=最良${KEEP_BEST:-3}+直近${KEEP_LATEST:-3}"
+  log "checkpoint uploader 起動: ${HF_REPO_ID}/${HF_CKPT_PREFIX:-checkpoints} every=${UPLOAD_EVERY:-${SAVE_FREQ:-10}} 保持=最良${KEEP_BEST:-3}+直近${KEEP_LATEST:-3} 中身=${HF_PUSH_CONTENTS:-lora}"
   python hf_checkpoint_uploader.py --mode watch &
   UPLOADER_PID=$!
 else
