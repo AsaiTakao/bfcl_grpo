@@ -39,6 +39,11 @@ ACTOR_OPTIM_OFFLOAD="${ACTOR_OPTIM_OFFLOAD:-False}"
 TRAIN_BATCH="${TRAIN_BATCH:-128}"                 # プロンプト数/step
 PPO_MINI_BATCH="${PPO_MINI_BATCH:-32}"
 MICRO_BATCH_PER_GPU="${MICRO_BATCH_PER_GPU:-4}"   # 8B + multi_turn は控えめに
+# log_prob 再計算(ref / rollout)の micro batch。verl は actor.use_dynamic_bsz=False の
+# とき ref と rollout の両方に log_prob_micro_batch_size(_per_gpu) を要求する
+# (未設定だと _validate_config が ValueError で落ちる)。前向き計算のみなので
+# 学習側より大きくできるが、既定は MICRO_BATCH_PER_GPU に揃えて OOM を避ける。
+LOG_PROB_MICRO_BATCH_PER_GPU="${LOG_PROB_MICRO_BATCH_PER_GPU:-${MICRO_BATCH_PER_GPU}}"
 MAX_PROMPT_LEN="${MAX_PROMPT_LEN:-4096}"          # 初期 config。long_context は別枠で拡張。
 MAX_RESPONSE_LEN="${MAX_RESPONSE_LEN:-2048}"      # 1ターンの think+tool_call 長
 GROUP_SIZE="${GROUP_SIZE:-8}"                     # GRPO の G。H100 x8 なら 8〜16 可
@@ -145,8 +150,9 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.multi_turn.tokenization_sanity_check_mode=ignore_strippable \
     actor_rollout_ref.rollout.multi_turn.tool_config_path="${TOOL_CONFIG}" \
     actor_rollout_ref.rollout.multi_turn.interaction_config_path="${INTERACTION_CONFIG}" \
+    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=${LOG_PROB_MICRO_BATCH_PER_GPU} \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
-    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=8 \
+    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=${LOG_PROB_MICRO_BATCH_PER_GPU} \
     algorithm.use_kl_in_reward=False \
     trainer.critic_warmup=0 \
     trainer.logger=[console,wandb] \
