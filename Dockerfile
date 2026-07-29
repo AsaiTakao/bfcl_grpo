@@ -29,7 +29,14 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # 評価サービング用の別イメージで使う)。
 ARG VERL_VERSION=0.4.1
 ARG SGLANG_VERSION=0.4.6.post5
-ARG TORCHAO_VERSION=0.11.0
+# sglang 0.4.6.post5 は torchao==0.9.0 / transformers==4.51.1 を厳密に固定する。
+# ここを別値にしても後の sglang インストールで上書きされるだけなので合わせる。
+ARG TORCHAO_VERSION=0.9.0
+ARG TRANSFORMERS_VERSION=4.51.1
+# peft / compressed-tensors は上限なしの推移依存で、放置すると最新版が入る。
+# 下の「依存の整合」レイヤーの説明を参照(どちらも実機で学習を落とした)。
+ARG PEFT_VERSION=0.15.2
+ARG COMPRESSED_TENSORS_VERSION=0.9.4
 ARG FLASH_ATTN_VERSION=2.7.4.post1
 # sglang/verl の依存解決がベースの torch 2.5.1 を 2.6.0+cu124 へ引き上げる
 # (CUDA 12.4 のままなので許容して進める)。実機で問題が出た場合の退避策として、
@@ -47,12 +54,32 @@ RUN set -e; \
 RUN set -e; \
     pip install --upgrade pip setuptools wheel packaging && \
     pip install "huggingface_hub[hf_transfer]" hf_transfer && \
-    pip install "torchao==${TORCHAO_VERSION}" && \
     pip install "flash-attn==${FLASH_ATTN_VERSION}" --no-build-isolation && \
     pip install "sglang[all]==${SGLANG_VERSION}" && \
     pip install "verl==${VERL_VERSION}" && \
     pip install "bfcl-eval" wandb pandas pyarrow && \
     if [ -n "${TORCH_PIN}" ]; then pip install "torch==${TORCH_PIN}"; fi
+
+# --- 依存の整合(上限なしの推移依存が最新版へ解決されるのを戻す)---------------
+# sglang / verl は peft と compressed-tensors をバージョン指定なしで要求するため、
+# ビルド時期によっては 2025 年の torch/transformers の上に 2026 年の最新版が乗る。
+# 実機で踏んだ不整合は 2 つ:
+#   - peft>=0.19 は torchao>=0.16 を要求する。sglang が固定する torchao 0.9.0 では
+#     LoRA 注入(get_peft_model)が
+#     "Found an incompatible version of torchao" で ImportError になる。
+#   - compressed-tensors>=0.16 は import 時に transformers.masking_utils
+#     (transformers 4.52 以降)を参照する。sglang が固定する 4.51.1 では
+#     sglang を掴む import 経路が ModuleNotFoundError になり、
+#     verl_lora_sglang_patch がパッチを当てられない(= LoRA 未マージのまま
+#     rollout が base 重みで走る)。
+# どちらも sglang 0.4.6.post5 と同時期のバージョンへ固定して回避する。
+# 必ず sglang/verl/bfcl-eval の後に置くこと(前だと上書きされる)。
+RUN set -e; \
+    pip install \
+        "torchao==${TORCHAO_VERSION}" \
+        "transformers==${TRANSFORMERS_VERSION}" \
+        "peft==${PEFT_VERSION}" \
+        "compressed-tensors==${COMPRESSED_TENSORS_VERSION}"
 
 # --- NCCL を最新へ手動アップグレード -----------------------------------------
 # 設計書: 8GPU 全部で all_reduce が通るか / 実際に速くなるかを実機ベンチで確認。
@@ -75,12 +102,32 @@ RUN set -e; \
 # 依存解決が壊れている(例: torch 引き上げによる flash-attn の ABI 不整合)。
 RUN python - <<'PY'
 import pkg_resources
-import torch, torchao, sglang, verl, flash_attn
-print("torch      :", torch.__version__)
-print("torchao    :", torchao.__version__)
-print("sglang     :", sglang.__version__)
-print("verl       :", getattr(verl, "__version__", "?"))
-print("flash_attn :", flash_attn.__version__)
+import torch, torchao, sglang, verl, flash_attn, transformers, peft, compressed_tensors
+print("torch             :", torch.__version__)
+print("torchao           :", torchao.__version__)
+print("sglang            :", sglang.__version__)
+print("verl              :", getattr(verl, "__version__", "?"))
+print("flash_attn        :", flash_attn.__version__)
+print("transformers      :", transformers.__version__)
+print("peft              :", peft.__version__)
+print("compressed_tensors:", compressed_tensors.__version__)
+
+# peft>=0.19 + torchao<0.16 だと LoRA 注入時にここで ImportError になる。
+# 実行時(GPU 課金中)ではなくビルド時に落とす。
+from peft.import_utils import is_torchao_available
+is_torchao_available()
+
+# verl_lora_sglang_patch が掴む本体。ここが import できないと LoRA が sglang へ
+# マージされず、rollout が base 重みのまま回る(学習が無意味になる)。
+# CPU ビルド機では GPU 不在に起因する失敗もあり得るので、依存欠落
+# (ModuleNotFoundError)だけをビルド失敗として扱う。
+try:
+    from verl.workers.sharding_manager.fsdp_sglang import FSDPSGLangShardingManager  # noqa: F401
+    print("fsdp_sglang       : OK")
+except ModuleNotFoundError as e:
+    raise SystemExit(f"[build-check] 依存の欠落で fsdp_sglang を import できません: {e}")
+except Exception as e:
+    print(f"[build-check] WARN: fsdp_sglang import は GPU 環境で要再確認: {type(e).__name__}: {e}")
 PY
 
 # --- モデル重みだけ焼き込む(secret でトークンを渡し、レイヤーに残さない)------

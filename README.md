@@ -234,6 +234,15 @@ DOCKER_BUILDKIT=1 docker build -f Dockerfile.eval -t <registry>/bfcl-eval:latest
 - **バージョン依存が強い**: verl / sglang / vLLM / bfcl_eval / tau-bench の API と
   CLI はバージョンで変わる。各所に env の逃げ道を用意している
   (`ROLLOUT_EXTRA_ARGS`、`TAU_RUN_CMD`、`REASONING_PARSER=""` など)。
+- **上限なしの推移依存はピンする**(Dockerfile「依存の整合」レイヤー)。sglang
+  0.4.6.post5 は `torchao==0.9.0` / `transformers==4.51.1` を厳密に固定する一方、
+  `peft` と `compressed-tensors` はバージョン指定なしで入るため、ビルド時期に
+  よって最新版が同居して壊れる。実際に踏んだもの:
+  `peft>=0.19` は `torchao>=0.16` を要求して LoRA 注入が ImportError、
+  `compressed-tensors>=0.16` は import 時に `transformers.masking_utils`
+  (4.52 以降)を参照して `import sglang` 経路が ModuleNotFoundError。
+  ビルド時 import 検査でこの 2 つを再現するようにしてあるので、
+  GPU 課金前(CPU ビルド)に検出できる。
 - **LoRA + sglang rollout は verl 0.4.1 単体では動かない**(検証済み)。verl の
   LoRA 配線は vLLM 経路にしか無く、`fsdp_sglang.py` は PEFT ラップの解除も
   adapter の merge もせずに `state_dict()` を sglang へ push するため、最初の
@@ -242,6 +251,10 @@ DOCKER_BUILDKIT=1 docker build -f Dockerfile.eval -t <registry>/bfcl-eval:latest
   (各 worker の `init_model()` で import される verl 公式フック)で当て、
   sglang へ渡す直前に `W += (B @ A) * alpha/r` を行って素の HF キーに戻す。
   学習側は LoRA のままなので数学的には通常の LoRA 学習と同じ。
+  パッチを当てられない場合(依存ズレで sglang 側を import できない等)は
+  **学習を中断する**。黙って続けると rollout が base 重みのまま回り、
+  GPU 時間だけ消えて結果が無意味になるため
+  (`BFCL_LORA_PATCH_OPTIONAL=1` で従来どおりスキップ継続にできる)。
   **未実機検証**: マージ計算とキー変換は `tests/test_lora_sglang_patch.py` で
   peft の `merge_and_unload()` と一致することまで確認済みだが、FSDP 実環境での
   メモリ・速度は 8×H100 で要確認(base 重みを一度 full tensor 化するため

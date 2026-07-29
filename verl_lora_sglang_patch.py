@@ -39,7 +39,9 @@ sglang 40GB + shard 2GB + 16GB ≒ 58GB で収まる見込み。足りない場�
 from __future__ import annotations
 
 import math
+import os
 import re
+import traceback
 from typing import Any, Dict, Mapping, Optional
 
 # PEFT が付ける接頭辞。get_peft_model(PeftModelForCausalLM) → .base_model
@@ -178,10 +180,29 @@ def _peft_model_of(module) -> Optional[Any]:
 def apply_patch() -> bool:
     """FSDPSGLangShardingManager.update_weights に LoRA マージを挟む。"""
     try:
-        from verl.workers.sharding_manager.fsdp_sglang import FSDPSGLangShardingManager
-    except Exception as e:  # noqa: BLE001  driver 側など sglang を import できない環境
-        log(f"FSDPSGLangShardingManager を import できずスキップ: {e}")
+        import verl  # noqa: F401
+    except Exception:  # noqa: BLE001  verl の無い環境(単体テスト等)では何もしない
         return False
+
+    try:
+        from verl.workers.sharding_manager.fsdp_sglang import FSDPSGLangShardingManager
+    except Exception as e:  # noqa: BLE001
+        # ここを黙って見逃すと、パッチ無しのまま学習が始まり LoRA が sglang へ
+        # マージされない = rollout がずっと base 重み、という最悪の失敗になる
+        # (GPU 課金だけ消えて学習結果が無意味)。既定では中断する。
+        msg = (
+            "FSDPSGLangShardingManager を import できません: "
+            f"{type(e).__name__}: {e}\n{traceback.format_exc()}"
+            "この状態で学習しても LoRA が rollout に反映されないため中断します。"
+            "依存のバージョン整合を確認してください"
+            "(Dockerfile の『依存の整合』レイヤー: peft / compressed-tensors / "
+            "transformers / torchao)。"
+            "承知の上で続行する場合のみ BFCL_LORA_PATCH_OPTIONAL=1 を設定してください。"
+        )
+        if os.environ.get("BFCL_LORA_PATCH_OPTIONAL") == "1":
+            log(f"スキップ(BFCL_LORA_PATCH_OPTIONAL=1): {msg}")
+            return False
+        raise RuntimeError(msg) from e
 
     if getattr(FSDPSGLangShardingManager, "_bfcl_lora_patched", False):
         return False
