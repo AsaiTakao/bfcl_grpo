@@ -55,19 +55,28 @@ except Exception:  # noqa: BLE001  ローカル単体テスト用フォールバ
 class BFCLMultiTurnTool(BaseTool):
     """1 ターン分の BFCL 関数呼び出しをまとめて実行するツール。"""
 
+    #: tool_schema から関数名が取れないとき(単体テストの簡易 schema 等)の名前。
+    DEFAULT_NAME = "bfcl_multi_turn_call"
+
     def __init__(self, config: dict, tool_schema: Any):
         super().__init__(config, tool_schema)
+        # verl 0.4.1 の BaseTool.__init__ は self.name へ
+        # tool_schema.function.name を「代入」する。よって name を read-only の
+        # property にすると "property 'name' has no setter" で初期化が落ちる。
+        # 代入されなかった経路(上のフォールバック stub / function.name が無い
+        # schema)だけをここで補う。
+        if not getattr(self, "name", None):
+            self.name = self._schema_name(tool_schema)
         self.reward_cfg = RewardConfig.from_dict(config)
         # instance_id -> ロールアウト状態
         self._sessions: Dict[str, Dict[str, Any]] = {}
 
-    # verl は name 属性で openai schema の関数名を参照する。
-    @property
-    def name(self) -> str:
+    @classmethod
+    def _schema_name(cls, tool_schema: Any) -> str:
         try:
-            return self.tool_schema.function.name
+            return tool_schema.function.name or cls.DEFAULT_NAME
         except Exception:  # noqa: BLE001
-            return "bfcl_multi_turn_call"
+            return cls.DEFAULT_NAME
 
     def get_openai_tool_schema(self):
         return self.tool_schema

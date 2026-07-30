@@ -110,6 +110,35 @@ class AstMatchTest(unittest.TestCase):
 
 
 # ------------------------------------------------------------------- tool
+class ToolNameTest(unittest.TestCase):
+    """verl の BaseTool.__init__ は self.name へ代入する。
+
+    name を read-only property にしていたため、実機の
+    ``initialize_tools_from_config`` が
+    "property 'name' of 'BFCLMultiTurnTool' object has no setter" で落ちた。
+    代入可能であることと、名前が取れない schema での既定名を固定する。
+    """
+
+    def _tool(self, schema):
+        import bfcl_verl_tool
+
+        return bfcl_verl_tool.BFCLMultiTurnTool({}, schema)
+
+    def test_name_is_assignable(self) -> None:
+        tool = self._tool(type("S", (), {})())
+        tool.name = "assigned_by_verl"  # ここで AttributeError にならないこと
+        self.assertEqual(tool.name, "assigned_by_verl")
+
+    def test_name_falls_back_when_schema_has_no_function(self) -> None:
+        tool = self._tool(type("S", (), {})())
+        self.assertEqual(tool.name, "bfcl_multi_turn_call")
+
+    def test_name_comes_from_schema_function(self) -> None:
+        function = type("F", (), {"name": "bfcl_multi_turn_call_v2"})()
+        schema = type("S", (), {"function": function})()
+        self.assertEqual(self._tool(schema).name, "bfcl_multi_turn_call_v2")
+
+
 class AstModeToolTest(unittest.TestCase):
     """mode="ast" は実行系(bfcl_eval)なしで完結することを固定する。"""
 
