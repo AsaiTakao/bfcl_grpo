@@ -14,11 +14,14 @@ verl_lora_sglang_patch の単体テスト。
   4. use_rslora=True では scaling が alpha / sqrt(r) になる
   5. DoRA は明示的に未対応エラー
   6. 対応する lora_B / base 重みが欠けていたら黙って進まない
+  7. asyncio.get_event_loop の uvloop 互換フォールバック(ループが無ければ作る /
+     同じループを使い続ける / 閉じたループは作り直す)
 
 実行: python -m pytest tests/test_lora_sglang_patch.py
 """
 from __future__ import annotations
 
+import asyncio
 import os
 import sys
 import unittest
@@ -183,6 +186,80 @@ class PeftEquivalenceTest(unittest.TestCase):
         self.assertTrue(
             torch.allclose(merged["q_proj.weight"], reference, atol=1e-6),
             f"max diff={(merged['q_proj.weight'] - reference).abs().max()}")
+
+
+class EventLoopFallbackTest(unittest.TestCase):
+    """asyncio.get_event_loop の uvloop 互換フォールバック。
+
+    verl 0.4.1 は worker のメインスレッドで get_event_loop + run_until_complete
+    を使うが、sglang が入れる uvloop の get_event_loop は current が無いと
+    RuntimeError を投げる(実機で初回 rollout が
+    "There is no current event loop in thread 'MainThread'" で停止した)。
+    """
+
+    def setUp(self) -> None:
+        # プロセスの実際のループ状態を触らずに済むよう、get/set とも差し替える。
+        self._saved_get = asyncio.get_event_loop
+        self._saved_set = asyncio.set_event_loop
+        self._current = None
+        self._created = []
+        asyncio.set_event_loop = self._record_current
+
+    def tearDown(self) -> None:
+        asyncio.get_event_loop = self._saved_get
+        asyncio.set_event_loop = self._saved_set
+        for loop in self._created:
+            if not loop.is_closed():
+                loop.close()
+
+    def _record_current(self, loop) -> None:
+        self._current = loop
+
+    def _install_uvloop_like(self) -> None:
+        """current が無いと必ず RuntimeError を投げる uvloop 相当に差し替える。"""
+        def strict_get_event_loop():
+            if self._current is None:
+                raise RuntimeError("There is no current event loop in thread 'MainThread'.")
+            return self._current
+
+        asyncio.get_event_loop = strict_get_event_loop
+        patch.ensure_event_loop_available()
+
+    def test_creates_loop_when_missing(self) -> None:
+        self._install_uvloop_like()
+        loop = asyncio.get_event_loop()
+        self._created.append(loop)
+        self.assertFalse(loop.is_closed())
+        self.assertEqual(loop.run_until_complete(_answer()), 42)
+
+    def test_reuses_the_same_loop(self) -> None:
+        self._install_uvloop_like()
+        first = asyncio.get_event_loop()
+        self._created.append(first)
+        # 作ったループは current に残るので、呼び直しても同じものが返る
+        # (sglang エンジンの非同期状態と齟齬が出ないことが重要)。
+        self.assertIs(asyncio.get_event_loop(), first)
+
+    def test_replaces_closed_loop(self) -> None:
+        closed = asyncio.new_event_loop()
+        closed.close()
+        asyncio.get_event_loop = lambda: closed
+        patch.ensure_event_loop_available()
+
+        loop = asyncio.get_event_loop()
+        self._created.append(loop)
+        self.assertIsNot(loop, closed)
+        self.assertFalse(loop.is_closed())
+
+    def test_is_idempotent(self) -> None:
+        self._install_uvloop_like()
+        patched = asyncio.get_event_loop
+        self.assertFalse(patch.ensure_event_loop_available())
+        self.assertIs(asyncio.get_event_loop, patched)
+
+
+async def _answer() -> int:
+    return 42
 
 
 if __name__ == "__main__":

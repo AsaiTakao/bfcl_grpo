@@ -98,17 +98,22 @@ if [[ "${LORA_RANK}" != "0" ]]; then
   EXTRA_ARGS+=( "actor_rollout_ref.model.lora_rank=${LORA_RANK}" )
   EXTRA_ARGS+=( "actor_rollout_ref.model.lora_alpha=${LORA_ALPHA}" )
   EXTRA_ARGS+=( "actor_rollout_ref.model.target_modules=${LORA_TARGETS}" )
-  if [[ "${ROLLOUT_NAME}" == "sglang" ]]; then
-    # PYTHONPATH に PROJECT_DIR が入っているので module 名で import できる。
-    EXTRA_ARGS+=( "actor_rollout_ref.model.external_lib=${LORA_PATCH_MODULE}" )
-    echo "[run] sglang 向け LoRA マージパッチを external_lib で適用: ${LORA_PATCH_MODULE}"
-  else
+  if [[ "${ROLLOUT_NAME}" != "sglang" ]]; then
     # vLLM 経路は verl 本体が adapter を engine へ渡す。その要件。
     EXTRA_ARGS+=( "actor_rollout_ref.rollout.load_format=safetensors" )
   fi
   echo "[run] LoRA 有効: r=${LORA_RANK} alpha=${LORA_ALPHA} targets=${LORA_TARGETS}"
 else
   echo "[run] LoRA 無効: フル FT で学習します。"
+fi
+
+# sglang 経路の verl パッチ。LoRA マージだけでなく asyncio(uvloop)互換の
+# 修正も入っており、後者は LoRA の有無に関係なく必要なので常に渡す
+# (パッチ側は PEFT ラップが無ければマージを行わない)。
+# PYTHONPATH に PROJECT_DIR が入っているので module 名で import できる。
+if [[ "${ROLLOUT_NAME}" == "sglang" ]]; then
+  EXTRA_ARGS+=( "actor_rollout_ref.model.external_lib=${LORA_PATCH_MODULE}" )
+  echo "[run] sglang 向け verl パッチを external_lib で適用: ${LORA_PATCH_MODULE}"
 fi
 
 # バージョン差でキー名が違う場合の逃げ道(例: ROLLOUT_EXTRA_ARGS="a.b=c d.e=f")。

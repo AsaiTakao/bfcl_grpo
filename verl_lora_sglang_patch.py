@@ -2,10 +2,18 @@
 """
 verl_lora_sglang_patch.py
 
-verl 0.4.1 の sglang rollout で LoRA 学習を成立させるパッチ。
+verl 0.4.1 の sglang rollout を成立させるパッチ集(external_lib で当てる)。
 
-なぜ必要か
-----------
+  1. LoRA を rollout へ渡す直前に base へマージする(下記)
+  2. asyncio.get_event_loop の「無ければ作る」フォールバック
+     (uvloop 互換。ensure_event_loop_available の docstring 参照)
+
+2 は LoRA の有無に関係なく sglang 経路で必要なため、run script は
+ROLLOUT_NAME=sglang なら常にこのモジュールを external_lib に渡す。
+1 は PEFT ラップが無ければ何もしないので、フル FT でも安全。
+
+なぜ必要か(LoRA マージ)
+------------------------
 verl 0.4.1 の LoRA 配線は vLLM 経路にしか無い。sglang 経路の
 ``FSDPSGLangShardingManager`` は PEFT ラップを解かず adapter のマージもせずに
 ``module.state_dict()`` をそのまま ``update_weights_from_tensor`` へ流すため、
@@ -38,6 +46,7 @@ sglang 40GB + shard 2GB + 16GB ≒ 58GB で収まる見込み。足りない場�
 """
 from __future__ import annotations
 
+import asyncio
 import math
 import os
 import re
@@ -170,6 +179,51 @@ def _add_lora_delta(weight, lora_a, lora_b, scaling: float) -> None:
     weight.add_(delta.to(dtype=weight.dtype, device=weight.device))
 
 
+# ------------------------------------------------- asyncio(uvloop)互換パッチ
+def ensure_event_loop_available() -> bool:
+    """``asyncio.get_event_loop()`` を「無ければ作る」挙動に戻す。
+
+    verl 0.4.1 は worker のメインスレッドで
+    ``loop = asyncio.get_event_loop(); loop.run_until_complete(...)`` を使う
+    (``fsdp_sglang`` の ``__enter__`` / ``__exit__``、``sglang_rollout`` の
+    ``generate_sequences`` / ``flush_cache``)。これは「メインスレッドなら
+    ループが無ければ暗黙に作る」という Python 3.9 までの挙動が前提。
+
+    ところが sglang はイベントループポリシーを uvloop に差し替える。uvloop の
+    ``get_event_loop`` は Python 3.12 以降の標準挙動に追随して「現在のループが
+    未設定なら作らずに RuntimeError」を投げるため、初回 rollout で
+
+        RuntimeError: There is no current event loop in thread 'MainThread'
+
+    になる(実機で val_before_train の generate_sequences 時に発生)。
+
+    verl 側を直せないので、このプロセス内だけ旧挙動を補う。作ったループは
+    以後も current のまま残るので、verl が各所で get_event_loop を呼び直しても
+    同じループを使い続ける(sglang エンジンの非同期状態と齟齬が出ない)。
+    閉じたループが current に残っている場合も作り直す
+    (``asyncio.run`` を通った後の "Event loop is closed" 対策)。
+    """
+    if getattr(asyncio.get_event_loop, "_bfcl_loop_fallback", False):
+        return False
+
+    original = asyncio.get_event_loop
+
+    def get_event_loop():
+        try:
+            loop = original()
+        except RuntimeError:
+            loop = None
+        if loop is None or loop.is_closed():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+        return loop
+
+    get_event_loop._bfcl_loop_fallback = True  # 二重適用の防止
+    asyncio.get_event_loop = get_event_loop
+    log("適用: asyncio.get_event_loop に「無ければ作る」フォールバック(uvloop 互換)")
+    return True
+
+
 # ------------------------------------------------------------------ パッチ適用
 def _peft_model_of(module) -> Optional[Any]:
     """FSDP でラップされたモジュールから PeftModel を取り出す(無ければ None)。"""
@@ -223,4 +277,6 @@ def apply_patch() -> bool:
     return True
 
 
+# import(= verl worker の init_model)時に両方当てる。
+ensure_event_loop_available()
 apply_patch()

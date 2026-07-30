@@ -36,7 +36,7 @@ BFCL multi_turn ──GRPO(verl/LoRA r=32)──▶ checkpoint ──▶ merge(H
 | `ast_match.py` | シングルターン(simple/multiple/parallel/live_*)の AST 照合採点 |
 | `bfcl_multiturn_grpo.yaml` / `bfcl_tool_config.yaml` / `bfcl_interaction_config.yaml` | verl 設定 |
 | `run_bfcl_grpo_h100x8.sh` | 学習起動(env 駆動、LoRA r=32、resume_mode=auto) |
-| `verl_lora_sglang_patch.py` | sglang へ重みを同期する直前に LoRA を base へマージする verl パッチ |
+| `verl_lora_sglang_patch.py` | sglang 経路の verl パッチ(LoRA を base へマージ / uvloop 互換) |
 | `dep_fixup.py` | 起動時に依存ピン(peft/compressed-tensors 等)のズレを検査し入れ直す |
 | `train_monitor.py` | train.log 監視: val 指標抽出・EarlyStopping(patience=3)・λ 減衰用 step 供給 |
 | `hf_checkpoint_uploader.py` | 200step ごと HF push(最良3+直近3保持)/ resume 復元 / merge 版最終 push |
@@ -270,6 +270,14 @@ DOCKER_BUILDKIT=1 docker build -f Dockerfile.eval -t <registry>/bfcl-eval:latest
   上げるなら AgentLoop への移植が別途必要。
   merge は `verl.model_merger` →失敗時 peft
   `merge_and_unload` の 2 段構え(`LORA_MERGE=0` でスキップ)。
+- **verl 0.4.1 + uvloop で初回 rollout が落ちる**。verl は worker の
+  メインスレッドで `asyncio.get_event_loop()` + `run_until_complete` を使うが
+  (`fsdp_sglang` の `__enter__`/`__exit__`、`sglang_rollout`)、sglang が入れる
+  uvloop の `get_event_loop` は current が未設定なら作らずに
+  `RuntimeError: There is no current event loop in thread 'MainThread'` を投げる。
+  `verl_lora_sglang_patch.ensure_event_loop_available()` で「無ければ作る」
+  旧挙動をプロセス内だけ復元している。LoRA の有無に関係なく必要なので、
+  `ROLLOUT_NAME=sglang` なら常に `external_lib` でこのモジュールを渡す。
 - **HF への checkpoint push は既定で LoRA adapter のみ**(`HF_PUSH_CONTENTS=lora`)。
   8B のフル checkpoint は FSDP shard + optimizer 状態で ~80GB/個 になり
   `SAVE_FREQ` ごとの push が現実的でないため。adapter は r=32 で ~200MB。
