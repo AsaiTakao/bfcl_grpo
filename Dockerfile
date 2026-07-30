@@ -36,8 +36,16 @@ ARG TRANSFORMERS_VERSION=4.51.1
 # peft / compressed-tensors は上限なしの推移依存で、放置すると最新版が入る。
 # 下の「依存の整合」レイヤーの説明を参照(どちらも実機で学習を落とした)。
 ARG PEFT_VERSION=0.15.2
-ARG COMPRESSED_TENSORS_VERSION=0.9.4
+# vllm 0.8.5.post1 が compressed-tensors==0.9.3 を厳密要求するため 0.9.3 に揃える。
+# ここで 0.9.4 を強制すると「依存の整合」層が vllm のピンを事後的に破る。
+# この固定の目的は 0.16 以降(transformers.masking_utils を参照する版)を防ぐこと
+# なので、0.9.3 でも目的は達成される。
+ARG COMPRESSED_TENSORS_VERSION=0.9.3
 ARG FLASH_ATTN_VERSION=2.7.4.post1
+# vllm は rollout には使わないが、インストール自体は必須(下の vllm レイヤー参照)。
+# torch を動かさない版を選ぶこと(torch 2.6.0 系 → vllm 0.8.5.post1)。
+# 未検証の組み合わせを踏んだら --build-arg VLLM_VERSION=... で差し替える。
+ARG VLLM_VERSION=0.8.5.post1
 # sglang/verl の依存解決がベースの torch 2.5.1 を 2.6.0+cu124 へ引き上げる
 # (CUDA 12.4 のままなので許容して進める)。実機で問題が出た場合の退避策として、
 # TORCH_PIN=2.5.1 のように指定すると全依存の導入後に torch を強制ピンする。
@@ -59,6 +67,25 @@ RUN set -e; \
     pip install "verl==${VERL_VERSION}" && \
     pip install "bfcl-eval" wandb pandas pyarrow && \
     if [ -n "${TORCH_PIN}" ]; then pip install "torch==${TORCH_PIN}"; fi
+
+# --- vllm(rollout では使わないが verl の import に必要)------------------------
+# verl 0.4.1 の verl.workers.sharding_manager は fsdp_vllm を無条件に import する
+# ため、rollout に sglang を使う構成でも vllm が無いと
+#   verl.workers.sharding_manager.fsdp_sglang → No module named 'vllm'
+# になり、verl_lora_sglang_patch が LoRA を rollout へマージできない
+# (= base 重みのまま rollout する = 学習が無意味)。実行時に
+# apply_patch() が RuntimeError で中断する設計なので、ここで必ず入れておく。
+#
+# 独立したレイヤーにしているのは、上の pip レイヤーが flash-attn の
+# コンパイルで 200 秒超かかるため。vllm のバージョンを試行錯誤しても
+# そこを作り直さずに済むようにする。
+#
+# import ではなくメタデータで確認する: CPU ビルド機では vllm の import が
+# CUDA 不在で失敗し得る(ビルド時 import 検査も ModuleNotFoundError 以外は
+# WARN 扱いにしてある)。ここで見たいのは「入っているか」だけ。
+RUN set -e; \
+    pip install "vllm==${VLLM_VERSION}" && \
+    python -c "import importlib.metadata as m; print('vllm', m.version('vllm'))"
 
 # --- 依存の整合(上限なしの推移依存が最新版へ解決されるのを戻す)---------------
 # sglang / verl は peft と compressed-tensors をバージョン指定なしで要求するため、

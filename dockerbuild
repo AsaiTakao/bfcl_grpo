@@ -1,0 +1,54 @@
+Run 'docker run --help' for more information
+ubuntu@dockerbuild:~/projects/bfcl_grpo$ cd ~/projects/bfcl_grpo && git pull
+
+# torch を動かさないか事前確認(既存層はキャッシュ済みなので数秒)
+head -66 Dockerfile > Dockerfile.debug
+DOCKER_BUILDKIT=1 docker build -f Dockerfile.debug -t bfcl-debug .
+docker run --rm bfcl-debug pip install --dry-run "vllm==0.8.5.post1" 2>&1 | tail -25
+Already up to date.
+[+] Building 300.5s (9/9) FINISHED                                                                                                                                                                                            docker:default
+ => [internal] load build definition from Dockerfile.debug                                                                                                                                                                              0.0s
+ => => transferring dockerfile: 3.82kB                                                                                                                                                                                                  0.0s
+ => resolve image config for docker-image://docker.io/docker/dockerfile:1.7                                                                                                                                                             1.2s
+ => CACHED docker-image://docker.io/docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e                                                                                                       0.0s
+ => => resolve docker.io/docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e                                                                                                                  0.0s
+ => [internal] load metadata for docker.io/pytorch/pytorch:2.5.1-cuda12.4-cudnn9-devel                                                                                                                                                  1.1s
+ => [internal] load .dockerignore                                                                                                                                                                                                       0.0s
+ => => transferring context: 627B                                                                                                                                                                                                       0.0s
+ => [1/3] FROM docker.io/pytorch/pytorch:2.5.1-cuda12.4-cudnn9-devel@sha256:14611869895df612b7b07227d5925f30ec3cd6673bad58ce3d84ed107950e014                                                                                            0.0s
+ => => resolve docker.io/pytorch/pytorch:2.5.1-cuda12.4-cudnn9-devel@sha256:14611869895df612b7b07227d5925f30ec3cd6673bad58ce3d84ed107950e014                                                                                            0.0s
+ => CACHED [2/3] RUN set -e;     apt-get update && apt-get install -y --no-install-recommends         git curl ca-certificates build-essential ninja-build &&     rm -rf /var/lib/apt/lists/*                                           0.0s
+ => CACHED [3/3] RUN set -e;     pip install --upgrade pip setuptools wheel packaging &&     pip install "huggingface_hub[hf_transfer]" hf_transfer &&     pip install "flash-attn==2.7.4.post1" --no-build-isolation &&     pip insta  0.0s
+ => exporting to image                                                                                                                                                                                                                298.1s
+ => => exporting layers                                                                                                                                                                                                               256.0s
+ => => exporting manifest sha256:14a4a42bebb3255c32abf7610fcdbe1073c8328d42a93d7423863f060b063007                                                                                                                                       0.0s
+ => => exporting config sha256:9bbac6fcff2dd9e9b008592746f789d763c45b11f581172341b38a6f4bc38d94                                                                                                                                         0.0s
+ => => exporting attestation manifest sha256:31f298c1fb97327653fd83582a4c7dc55da9ca63e430002a27af7683476a44b2                                                                                                                           0.0s
+ => => exporting manifest list sha256:370e48f9c2367c2e30e515003ad69f30adf8c6189b2fb79f45b66d2d38fc5f73                                                                                                                                  0.0s
+ => => naming to docker.io/library/bfcl-debug:latest                                                                                                                                                                                    0.0s
+ => => unpacking to docker.io/library/bfcl-debug:latest                                                                                                                                                                                42.0s
+  Downloading numpy-2.2.6-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl.metadata (62 kB)
+Requirement already satisfied: python-dotenv>=0.21.0 in /opt/conda/lib/python3.11/site-packages (from pydantic-settings>=2.0.0->fastapi[standard]>=0.115.0->vllm==0.8.5.post1) (1.2.2)
+Requirement already satisfied: click>=7.0 in /opt/conda/lib/python3.11/site-packages (from ray!=2.44.*,>=2.43.0->ray[cgraph]!=2.44.*,>=2.43.0->vllm==0.8.5.post1) (8.4.2)
+Requirement already satisfied: msgpack<2.0.0,>=1.0.0 in /opt/conda/lib/python3.11/site-packages (from ray!=2.44.*,>=2.43.0->ray[cgraph]!=2.44.*,>=2.43.0->vllm==0.8.5.post1) (1.2.1)
+Collecting cupy-cuda12x (from ray[cgraph]!=2.44.*,>=2.43.0->vllm==0.8.5.post1)
+  Downloading cupy_cuda12x-14.1.1-cp311-cp311-manylinux2014_x86_64.whl.metadata (2.8 kB)
+Requirement already satisfied: rich>=13.7.1 in /opt/conda/lib/python3.11/site-packages (from rich-toolkit>=0.14.8->fastapi-cli>=0.0.32->fastapi-cli[standard]>=0.0.32; extra == "standard"->fastapi[standard]>=0.115.0->vllm==0.8.5.post1) (15.0.0)
+Requirement already satisfied: markdown-it-py>=2.2.0 in /opt/conda/lib/python3.11/site-packages (from rich>=13.7.1->rich-toolkit>=0.14.8->fastapi-cli>=0.0.32->fastapi-cli[standard]>=0.0.32; extra == "standard"->fastapi[standard]>=0.115.0->vllm==0.8.5.post1) (4.2.0)
+Requirement already satisfied: pygments<3.0.0,>=2.13.0 in /opt/conda/lib/python3.11/site-packages (from rich>=13.7.1->rich-toolkit>=0.14.8->fastapi-cli>=0.0.32->fastapi-cli[standard]>=0.0.32; extra == "standard"->fastapi[standard]>=0.115.0->vllm==0.8.5.post1) (2.18.0)
+Requirement already satisfied: mdurl~=0.1 in /opt/conda/lib/python3.11/site-packages (from markdown-it-py>=2.2.0->rich>=13.7.1->rich-toolkit>=0.14.8->fastapi-cli>=0.0.32->fastapi-cli[standard]>=0.0.32; extra == "standard"->fastapi[standard]>=0.115.0->vllm==0.8.5.post1) (0.1.2)
+Requirement already satisfied: regex in /opt/conda/lib/python3.11/site-packages (from tiktoken>=0.6.0->vllm==0.8.5.post1) (2026.7.19)
+Requirement already satisfied: safetensors>=0.4.3 in /opt/conda/lib/python3.11/site-packages (from transformers>=4.51.1->vllm==0.8.5.post1) (0.8.0)
+Requirement already satisfied: shellingham>=1.3.0 in /opt/conda/lib/python3.11/site-packages (from typer>=0.16.0->fastapi-cli>=0.0.32->fastapi-cli[standard]>=0.0.32; extra == "standard"->fastapi[standard]>=0.115.0->vllm==0.8.5.post1) (1.5.4)
+Collecting httptools>=0.8.0 (from uvicorn[standard]>=0.12.0; extra == "standard"->fastapi[standard]>=0.115.0->vllm==0.8.5.post1)
+  Downloading httptools-0.8.0-cp311-cp311-manylinux1_x86_64.manylinux_2_28_x86_64.manylinux_2_5_x86_64.whl.metadata (3.5 kB)
+Requirement already satisfied: uvloop>=0.15.1 in /opt/conda/lib/python3.11/site-packages (from uvicorn[standard]>=0.12.0; extra == "standard"->fastapi[standard]>=0.115.0->vllm==0.8.5.post1) (0.22.1)
+Requirement already satisfied: websockets>=13.0 in /opt/conda/lib/python3.11/site-packages (from uvicorn[standard]>=0.12.0; extra == "standard"->fastapi[standard]>=0.115.0->vllm==0.8.5.post1) (16.1.1)
+Requirement already satisfied: aiohappyeyeballs>=2.5.0 in /opt/conda/lib/python3.11/site-packages (from aiohttp->vllm==0.8.5.post1) (2.7.1)
+Requirement already satisfied: aiosignal>=1.4.0 in /opt/conda/lib/python3.11/site-packages (from aiohttp->vllm==0.8.5.post1) (1.4.0)
+Requirement already satisfied: frozenlist>=1.1.1 in /opt/conda/lib/python3.11/site-packages (from aiohttp->vllm==0.8.5.post1) (1.8.0)
+Requirement already satisfied: multidict<7.0,>=4.5 in /opt/conda/lib/python3.11/site-packages (from aiohttp->vllm==0.8.5.post1) (6.7.1)
+Requirement already satisfied: propcache>=0.2.0 in /opt/conda/lib/python3.11/site-packages (from aiohttp->vllm==0.8.5.post1) (0.5.2)
+Requirement already satisfied: yarl<2.0,>=1.17.0 in /opt/conda/lib/python3.11/site-packages (from aiohttp->vllm==0.8.5.post1) (1.24.5)
+Requirement already satisfied: cuda-pathfinder==1.*,>=1.3.4 in /opt/conda/lib/python3.11/site-packages (from cupy-cuda12x->ray[cgraph]!=2.44.*,>=2.43.0->vllm==0.8.5.post1) (1.6.0)
+Would install Deprecated-1.3.1 astor-0.8.1 blake3-1.0.9 cachetools-7.1.6 compressed-tensors-0.9.3 cupy-cuda12x-14.1.1 depyf-0.18.0 detect-installer-0.1.0 fastapi-cli-0.0.32 fastapi-cloud-cli-0.23.0 fastar-0.11.0 gguf-0.19.0 httptools-0.8.0 importlib_metadata-8.0.0 lark-1.2.2 llvmlite-0.44.0 lm-format-enforcer-0.10.12 mistral_common-1.11.7 numba-0.61.2 numpy-2.2.6 opencv-python-headless-5.0.0.93 opentelemetry-api-1.26.0 opentelemetry-exporter-otlp-1.26.0 opentelemetry-exporter-otlp-proto-common-1.26.0 opentelemetry-exporter-otlp-proto-grpc-1.26.0 opentelemetry-exporter-otlp-proto-http-1.26.0 opentelemetry-proto-1.26.0 opentelemetry-sdk-1.26.0 opentelemetry-semantic-conventions-0.47b0 opentelemetry-semantic-conventions-ai-0.4.13 pillow-12.3.0 prometheus-fastapi-instrumentator-8.1.0 protobuf-4.25.9 py-cpuinfo-9.0.0 pydantic-extra-types-2.11.1 pydantic-settings-2.14.2 python-json-logger-4.1.0 rich-toolkit-0.20.3 rignore-0.8.0 torchaudio-2.6.0 vllm-0.8.5.post1 watchfiles-1.2.0 xformers-0.0.29.post2 xgrammar-0.1.18
