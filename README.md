@@ -33,6 +33,7 @@ BFCL multi_turn ──GRPO(verl/LoRA r=32)──▶ checkpoint ──▶ merge(H
 | `bfcl_verl_tool.py` | verl `BaseTool`(`BFCLMultiTurnTool`) |
 | `bfcl_backend.py` | BFCL バックエンドクラスの動的ロード/実行/状態比較 |
 | `mt_reward.py` | 二層報酬(process × λ(step) + outcome × γ 後方伝播) |
+| `bfcl_reward.py` | verl 報酬フック: rollout の reward_scores(ツール算出の二層報酬)を GRPO の報酬に配線 |
 | `ast_match.py` | シングルターン(simple/multiple/parallel/live_*)の AST 照合採点 |
 | `bfcl_multiturn_grpo.yaml` / `bfcl_tool_config.yaml` / `bfcl_interaction_config.yaml` | verl 設定 |
 | `run_bfcl_grpo_h100x8.sh` | 学習起動(env 駆動、LoRA r=32、resume_mode=auto) |
@@ -270,6 +271,14 @@ DOCKER_BUILDKIT=1 docker build -f Dockerfile.eval -t <registry>/bfcl-eval:latest
   上げるなら AgentLoop への移植が別途必要。
   merge は `verl.model_merger` →失敗時 peft
   `merge_and_unload` の 2 段構え(`LORA_MERGE=0` でスキップ)。
+- **報酬は verl の naive reward manager に届かない**。ツール
+  (`BFCLMultiTurnTool.calc_reward`)の二層報酬は rollout が
+  `non_tensor_batch["reward_scores"]` に格納するが、verl 0.4.1 の naive
+  manager はこれを読まず `data_source` で同梱 reward を引いて
+  `NotImplementedError` になる(実機で確認)。`bfcl_reward.py` を
+  `custom_reward_function.path` で渡し、import 副作用で
+  `NaiveRewardManager.__call__` を reward_scores 優先に差し替えて配線する。
+  reward_scores が無い行のみテキストから再採点するフォールバック付き。
 - **verl 0.4.1 + uvloop で初回 rollout が落ちる**。verl は worker の
   メインスレッドで `asyncio.get_event_loop()` + `run_until_complete` を使うが
   (`fsdp_sglang` の `__enter__`/`__exit__`、`sglang_rollout`)、sglang が入れる
