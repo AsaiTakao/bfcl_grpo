@@ -15,15 +15,20 @@ repo 内レイアウト(HF_REPO_ID 直下):
   checkpoints/global_step_N/...   verl checkpoint(最大 6 つ保持)
   checkpoints/val_metrics.jsonl   train_monitor が抽出した eval 履歴
   checkpoints/train.log           学習ログ(resume 時に復元し末尾へ追記)
+  checkpoints/entrypoint-*.log    起動時ログ(entrypoint.sh。起動ごとに 1 本)
   checkpoints/latest_checkpointed_iteration.txt   resume 用
   merged-final/...                学習終了後の merge 版(HF 形式)+ eval_record.json
 
 モード:
   watch   : entrypoint が背景起動。CKPT_DIR を polling し、書き込み完了済みの
             step % UPLOAD_EVERY == 0 checkpoint を push → HF 側を保持ポリシーで剪定。
-  final   : 学習終了後に「今ある最新」を step 条件無視で同期 push + 剪定。
+            併せて CKPT_DIR 直下の *.log を LOG_UPLOAD_SECONDS ごとに push。
+  final   : 学習終了後に「今ある最新」を step 条件無視で同期 push + 剪定 + ログ push。
   restore : HF 上の最新 checkpoint を CKPT_DIR へ DL(resume 用。無ければ何もしない)。
+            checkpoint を戻さない場合(HF_PUSH_CONTENTS=lora)でも train.log と
+            val_metrics.jsonl だけは戻す(空ログで上書きして過去分を失わない)。
   merged  : 最良(無ければ最新)checkpoint を merge → merged-final/ へ同期 push。
+  logs    : ログだけを同期 push(checkpoint の有無に関係なく)。
 
 環境変数(引数でも指定可):
   CKPT_DIR        verl の default_local_dir(global_step_* が並ぶ場所)
@@ -38,10 +43,16 @@ repo 内レイアウト(HF_REPO_ID 直下):
                   tokenizer/config のみ / full=FSDP shard・optimizer も含む全部。
                   lora のときは optimizer 状態が無いため HF からの resume は不可。
   HF_TOKEN        書き込みトークン(未指定なら hf のログイン情報を使用)
+  HF_LOG_FILES    HF へ上げるログの明示指定(":" or "," 区切り)。
+                  既定は CKPT_DIR 直下の *.log すべて。
+  LOG_UPLOAD_SECONDS  watch のログ push 間隔秒(既定 300)
+  HF_LOG_MAX_MB   1 ファイルの上限 MB(既定 50)。超える分は「中央」を中略する
+                  (先頭を捨てると DOK コンソールと同じ「先頭が切れたログ」になる)
 """
 from __future__ import annotations
 
 import argparse
+import glob
 import json
 import os
 import re
@@ -64,6 +75,8 @@ _LORA_ONLY_PATTERNS = ["*/lora_adapter/*", "*/huggingface/*"]
 # checkpoint と一緒に push/restore する(コンテナ再起動で workspace が
 # 消えても過去分が末尾追記の起点として復元される)。
 _TRAIN_LOG_FILE = "train.log"
+# ログとして扱うファイル(CKPT_DIR 直下)。train.log と entrypoint-*.log。
+_LOG_GLOB = "*.log"
 
 
 def _env(name: str, default: Optional[str] = None) -> Optional[str]:
@@ -144,6 +157,180 @@ def select_keep_steps(steps: List[int], metrics: List[Dict],
     return keep
 
 
+# ------------------------------------------------------------------- ログ側
+def log_files(ckpt_dir: str) -> List[str]:
+    """HF へ上げるログファイルの実パス一覧。
+
+    既定は CKPT_DIR 直下の *.log(train.log と entrypoint-*.log)。
+    HF_LOG_FILES(":" または "," 区切り)を指定するとそのパスだけを対象にする。
+
+    毎回 glob し直すのは、watch を起動した時点ではまだ train.log が
+    存在しないため(entrypoint は uploader を学習より先に起動する)。
+    """
+    spec = _env("HF_LOG_FILES")
+    if spec:
+        paths = [p.strip() for p in re.split(r"[:,]", spec) if p.strip()]
+    else:
+        paths = sorted(glob.glob(os.path.join(ckpt_dir, _LOG_GLOB)))
+    out: List[str] = []
+    seen: Set[str] = set()
+    for p in paths:
+        base = os.path.basename(p)
+        if base in seen or not os.path.isfile(p):
+            continue
+        seen.add(base)      # repo 側は basename で置くため同名は 1 つだけ
+        out.append(p)
+    return out
+
+
+def capped_log_bytes(path: str, max_bytes: int) -> bytes:
+    """ログを max_bytes 以内に収めて読む。超える場合は「中央」を中略する。
+
+    末尾だけ残す(= 先頭を捨てる)実装にしないのは、それでは DOK コンソールと
+    同じ「先頭が切れたログ」になり、起動時の設定・データ準備・最初の step という
+    一番読みたい部分が消えるため。
+    """
+    size = os.path.getsize(path)
+    with open(path, "rb") as f:
+        if max_bytes <= 0 or size <= max_bytes:
+            return f.read()
+        half = max_bytes // 2
+        head = f.read(half)
+        f.seek(size - half)
+        tail = f.read(half)
+    marker = (f"\n==== [uploader] 中略: {size - 2 * half} bytes 省略 "
+              f"(元サイズ {size} bytes) ====\n").encode("utf-8")
+    return head + marker + tail
+
+
+class LogSync:
+    """学習ログを checkpoint の push とは独立に HF へ送る。
+
+    なぜ独立させるか: DOK のコンソールは先頭が切り落とされるため、ログは repo 側
+    に残さないと読めない。checkpoint push に相乗りさせるだけでは
+      - 最初の checkpoint(SAVE_FREQ step 目)より前に落ちた場合
+      - HF_PUSH_CONTENTS=lora で adapter が無く push をスキップした場合
+      - push が失敗した場合
+    にログが 1 バイトも残らず、原因調査ができない。
+
+    サイズ・mtime が変わっていないファイルは送らない(空コミットを積まない)。
+    """
+
+    def __init__(self, api, repo_id: str, prefix: str, ckpt_dir: str,
+                 interval: int = 300, max_bytes: int = 50 * 1024 * 1024):
+        self.api = api
+        self.repo_id = repo_id
+        self.prefix = prefix
+        self.ckpt_dir = ckpt_dir
+        self.interval = interval
+        self.max_bytes = max_bytes
+        self._sent: Dict[str, Tuple[int, int]] = {}   # path -> (size, mtime)
+        self._next_at = 0.0
+        self._repo_ready = False
+
+    def sync(self, force: bool = False, reason: str = "periodic") -> int:
+        """対象ログを push する。force=False なら interval を待つ。送った数を返す。"""
+        now = time.time()
+        if not force and now < self._next_at:
+            return 0
+        self._next_at = now + max(self.interval, 10)
+        return sum(self._sync_one(p, reason) for p in log_files(self.ckpt_dir))
+
+    def _sync_one(self, path: str, reason: str) -> int:
+        try:
+            st = os.stat(path)
+        except OSError:
+            return 0
+        sig = (st.st_size, int(st.st_mtime))
+        if self._sent.get(path) == sig:
+            return 0                      # 変化なし
+        name = os.path.basename(path)
+        try:
+            payload = capped_log_bytes(path, self.max_bytes)
+            if not self._repo_ready:
+                self.api.create_repo(self.repo_id, repo_type="model",
+                                     exist_ok=True, private=True)
+                self._repo_ready = True
+            self.api.upload_file(
+                path_or_fileobj=payload,
+                repo_id=self.repo_id,
+                path_in_repo=f"{self.prefix}/{name}",
+                commit_message=f"log: {name} ({reason})",
+            )
+        except Exception as e:  # noqa: BLE001  ログ送信の失敗で学習を止めない
+            print(f"[uploader] ログ push 失敗 {name}: {e}", file=sys.stderr,
+                  flush=True)
+            return 0
+        self._sent[path] = sig
+        log(f"ログ push: {self.prefix}/{name} ({st.st_size}B, {reason})")
+        return 1
+
+
+def _log_sync(api, args) -> LogSync:
+    return LogSync(api, args.repo_id, args.prefix, args.ckpt_dir,
+                   interval=args.log_every,
+                   max_bytes=max(args.log_max_mb, 0) * 1024 * 1024)
+
+
+def _move_meta(tmp: str, prefix: str, ckpt_dir: str,
+               names: Tuple[str, ...]) -> List[str]:
+    """DL 済み一時ディレクトリから CKPT_DIR へ meta を移す。移せた名前を返す。
+
+    ローカルに既に同名がある場合は触らない(今回の起動で書き始めたものを
+    HF 上の古い版で潰さない)。
+    """
+    os.makedirs(ckpt_dir, exist_ok=True)
+    moved: List[str] = []
+    for name in names:
+        src = os.path.join(tmp, prefix, name)
+        dst = os.path.join(ckpt_dir, name)
+        if os.path.isfile(src) and not os.path.isfile(dst):
+            shutil.move(src, dst)
+            moved.append(name)
+    return moved
+
+
+def restore_meta(ckpt_dir: str, repo_id: str, prefix: str,
+                 token: Optional[str]) -> List[str]:
+    """train.log と val_metrics.jsonl だけを HF から戻す(checkpoint は触らない)。
+
+    なぜ checkpoint を戻さないケースでも必要か: train.log は repo 側で固定名
+    (checkpoints/train.log)なので、復元せずに学習を始めると LogSync が
+    「今回の起動分だけ」の短いログを同名で push し、HF 上の過去の学習経過を
+    上書きして消してしまう。DOK コンソールは先頭が切れるため、そうなると
+    起動〜最初の step の記録がどこにも残らない。
+
+    latest_checkpointed_iteration.txt は戻さない(戻すと resume_mode=auto が
+    存在しない checkpoint を掴んで壊れる)。
+    """
+    from huggingface_hub import snapshot_download
+
+    want = tuple(n for n in (_TRAIN_LOG_FILE, _METRICS_FILE)
+                 if not os.path.isfile(os.path.join(ckpt_dir, n)))
+    if not want:
+        return []
+    tmp = os.path.join(ckpt_dir, "_restore_meta_tmp")
+    shutil.rmtree(tmp, ignore_errors=True)
+    try:
+        snapshot_download(
+            repo_id=repo_id,
+            repo_type="model",
+            allow_patterns=[f"{prefix}/{n}" for n in want],
+            local_dir=tmp,
+            token=token,
+        )
+        moved = _move_meta(tmp, prefix, ckpt_dir, want)
+    except Exception as e:  # noqa: BLE001  repo 未作成・初回起動など
+        log(f"ログ/val 履歴の restore をスキップ(初回なら正常): {e}")
+        moved = []
+    shutil.rmtree(tmp, ignore_errors=True)
+    if moved:
+        log(f"restore: {', '.join(moved)} を復元(以降は末尾へ追記)")
+    else:
+        log("HF 上に過去の train.log / val 履歴なし(新規として開始)")
+    return moved
+
+
 # ------------------------------------------------------------------- HF 側
 def _api(token: Optional[str]):
     from huggingface_hub import HfApi
@@ -175,7 +362,8 @@ def has_lora_adapter(step_path: str) -> bool:
 
 
 def push_checkpoint(api, repo_id: str, prefix: str, step: int, path: str,
-                    ckpt_dir: str, contents: str = "full") -> None:
+                    ckpt_dir: str, contents: str = "full",
+                    log_max_bytes: int = 50 * 1024 * 1024) -> None:
     """global_step_N を repo へ push し、resume 用メタも同時に上げる。
 
     contents="lora" のときは LoRA adapter と tokenizer/config だけを上げる
@@ -193,13 +381,16 @@ def push_checkpoint(api, repo_id: str, prefix: str, step: int, path: str,
     )
     for meta in (_LATEST_FILE, _METRICS_FILE, _TRAIN_LOG_FILE):
         mp = os.path.join(ckpt_dir, meta)
-        if os.path.isfile(mp):
-            api.upload_file(
-                path_or_fileobj=mp,
-                repo_id=repo_id,
-                path_in_repo=f"{prefix}/{meta}",
-                commit_message=f"meta update (step={step})",
-            )
+        if not os.path.isfile(mp):
+            continue
+        # ログは巨大化し得るので上限付きで読む(LogSync と同じ扱い)。
+        body = capped_log_bytes(mp, log_max_bytes) if meta.endswith(".log") else mp
+        api.upload_file(
+            path_or_fileobj=body,
+            repo_id=repo_id,
+            path_in_repo=f"{prefix}/{meta}",
+            commit_message=f"meta update (step={step})",
+        )
 
 
 def prune_remote(api, repo_id: str, prefix: str, metrics: List[Dict],
@@ -238,7 +429,9 @@ def _push_once(api, args, step: int, path: str) -> bool:
         f"{args.repo_id}/{args.prefix}/global_step_{step}")
     try:
         push_checkpoint(api, args.repo_id, args.prefix, step, path,
-                        args.ckpt_dir, contents=contents)
+                        args.ckpt_dir, contents=contents,
+                        log_max_bytes=max(getattr(args, "log_max_mb", 50), 0)
+                        * 1024 * 1024)
         prune_remote(api, args.repo_id, args.prefix,
                      load_val_metrics(args.ckpt_dir), args.keep_best, args.keep_latest)
         log(f"done step={step}")
@@ -251,9 +444,10 @@ def _push_once(api, args, step: int, path: str) -> bool:
 def mode_watch(args, token: Optional[str]) -> int:
     api = _api(token)
     uploaded: Set[int] = remote_steps(api, args.repo_id, args.prefix)
+    logs = _log_sync(api, args)
     log(f"watch start dir={args.ckpt_dir} every={args.every} "
         f"keep=best{args.keep_best}+latest{args.keep_latest} "
-        f"既存remote={sorted(uploaded)}")
+        f"log_every={args.log_every}s 既存remote={sorted(uploaded)}")
     while True:
         done = completed_step(args.ckpt_dir)
         for step, path in local_checkpoints(args.ckpt_dir):
@@ -263,12 +457,22 @@ def mode_watch(args, token: Optional[str]) -> int:
                 continue
             if _push_once(api, args, step, path):
                 uploaded.add(step)
+        # checkpoint が 1 つも生まれていなくてもログは送る(落ちたときに
+        # DOK コンソールしか残っていないと先頭が切れて原因が読めない)。
+        logs.sync()
         time.sleep(max(args.poll, 5))
 
 
 def mode_final(args, token: Optional[str]) -> int:
-    """学習終了後: 最新 checkpoint を step 条件無視で同期 push(取りこぼし防止)。"""
+    """学習終了後: 最新 checkpoint を step 条件無視で同期 push(取りこぼし防止)。
+
+    checkpoint の有無・push の成否に関わらず、先にログを送る(学習が
+    checkpoint を作る前に落ちたケースが一番ログを読みたい)。
+    """
     api = _api(token)
+    logs = _log_sync(api, args)
+    logs.sync(force=True, reason="final")
+
     ckpts = local_checkpoints(args.ckpt_dir)
     if not ckpts:
         log("ローカル checkpoint 無し。final push をスキップ。")
@@ -287,6 +491,19 @@ def mode_final(args, token: Optional[str]) -> int:
     return 0 if _push_once(api, args, step, path) else 1
 
 
+def mode_logs(args, token: Optional[str]) -> int:
+    """ログだけを同期 push する。
+
+    entrypoint の final_sync 末尾から呼ぶことで、最終 push / merge の結果や
+    終了理由(EarlyStopping・OOM など)まで含めた最後の数十行を repo に残す。
+    """
+    logs = _log_sync(_api(token), args)
+    n = logs.sync(force=True, reason=args.reason)
+    if n == 0:
+        log(f"push するログがありません(dir={args.ckpt_dir})")
+    return 0
+
+
 def mode_restore(args, token: Optional[str]) -> int:
     """resume 用: HF 上の最新 checkpoint を CKPT_DIR へ戻す(無ければ何もしない)。"""
     from huggingface_hub import snapshot_download
@@ -297,17 +514,24 @@ def mode_restore(args, token: Optional[str]) -> int:
         # 中途半端に戻して resume_mode=auto に拾わせると壊れるので何もしない。
         log("HF_PUSH_CONTENTS=lora のため HF からの resume は行いません"
             "(adapter のみで optimizer 状態が無いため)。fresh start します。")
+        # ただしログと val 履歴は戻す。戻さないと今回の短い train.log を
+        # 同名で push して HF 上の前回起動分を上書きしてしまう。
+        restore_meta(args.ckpt_dir, args.repo_id, args.prefix, token)
         return 0
 
     api = _api(token)
     steps = remote_steps(api, args.repo_id, args.prefix)
     if not steps:
+        # checkpoint が無くても前回起動の train.log は repo にあり得る
+        # (最初の save より前に落ちた場合)。上書きで消さないよう戻す。
         log("HF 上に checkpoint 無し。fresh start します。")
+        restore_meta(args.ckpt_dir, args.repo_id, args.prefix, token)
         return 0
     step = max(steps)
     local = os.path.join(args.ckpt_dir, f"global_step_{step}")
     if os.path.isdir(local):
         log(f"global_step_{step} はローカルに存在。restore 不要。")
+        restore_meta(args.ckpt_dir, args.repo_id, args.prefix, token)
         return 0
     log(f"restore: {args.repo_id}/{args.prefix}/global_step_{step} -> {local}")
     tmp = os.path.join(args.ckpt_dir, "_restore_tmp")
@@ -324,11 +548,7 @@ def mode_restore(args, token: Optional[str]) -> int:
     os.makedirs(args.ckpt_dir, exist_ok=True)
     shutil.move(os.path.join(tmp, args.prefix, f"global_step_{step}"), local)
     # val 履歴と train.log も戻す(保持ポリシー・merge 選定・ログ追記の連続性)。
-    for meta in (_METRICS_FILE, _TRAIN_LOG_FILE):
-        mfile = os.path.join(tmp, args.prefix, meta)
-        if os.path.isfile(mfile) and not os.path.isfile(
-                os.path.join(args.ckpt_dir, meta)):
-            shutil.move(mfile, os.path.join(args.ckpt_dir, meta))
+    _move_meta(tmp, args.prefix, args.ckpt_dir, (_METRICS_FILE, _TRAIN_LOG_FILE))
     shutil.rmtree(tmp, ignore_errors=True)
     # verl の resume_mode=auto はこのファイルを見る。
     with open(os.path.join(args.ckpt_dir, _LATEST_FILE), "w", encoding="utf-8") as f:
@@ -406,7 +626,8 @@ def mode_merged(args, token: Optional[str]) -> int:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mode", choices=["watch", "final", "restore", "merged"],
+    ap.add_argument("--mode",
+                    choices=["watch", "final", "restore", "merged", "logs"],
                     default="watch")
     ap.add_argument("--ckpt-dir", default=_env("CKPT_DIR"))
     ap.add_argument("--repo-id", default=_env("HF_REPO_ID"))
@@ -420,6 +641,16 @@ def main() -> int:
     ap.add_argument("--poll", type=int, default=int(_env("POLL_SECONDS", "60")))
     ap.add_argument("--merged-dir", default=_env("MERGED_DIR", "/workspace/merged/final"))
     ap.add_argument("--merged-prefix", default=_env("HF_MERGED_PREFIX", "merged-final"))
+    # ログ push(DOK コンソールは先頭が切れるため repo 側に必ず残す)。
+    # checkpoint 間隔(--every, step 単位)とは別に、秒単位で送る。
+    ap.add_argument("--log-every", type=int,
+                    default=int(_env("LOG_UPLOAD_SECONDS", "300")),
+                    help="watch でログを push する間隔秒(既定 300)")
+    ap.add_argument("--log-max-mb", type=int,
+                    default=int(_env("HF_LOG_MAX_MB", "50")),
+                    help="ログ 1 ファイルの上限 MB。超過分は中央を中略する")
+    ap.add_argument("--reason", default="manual",
+                    help="mode=logs のコミットメッセージに載せる理由")
     ap.add_argument("--contents", choices=["lora", "full"],
                     default=_env("HF_PUSH_CONTENTS", "lora"),
                     help="HF へ上げる中身。lora=adapter と tokenizer/config のみ"
@@ -438,6 +669,8 @@ def main() -> int:
         return mode_final(args, token)
     if args.mode == "restore":
         return mode_restore(args, token)
+    if args.mode == "logs":
+        return mode_logs(args, token)
     return mode_merged(args, token)
 
 

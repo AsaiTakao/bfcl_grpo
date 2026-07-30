@@ -52,6 +52,21 @@ except Exception:  # noqa: BLE001  ローカル単体テスト用フォールバ
             return self.tool_schema
 
 
+#: observation 1 件の最大文字数(0 以下で無効)。
+#: BFCL のバックエンドは巨大な dict(ファイルツリー、便一覧など)を返すことが
+#: あり、tool 応答も verl の max_response_length を食う。これが膨らむと think +
+#: tool_call の余地が消えて応答が途中で打ち切られ、報酬 0 になる。
+MAX_OBS_CHARS = int(os.getenv("BFCL_MAX_OBS_CHARS", "2000"))
+
+
+def _truncate_obs(text: str) -> str:
+    """observation を予算内に収める。切ったことは明示する(黙って切ると
+    モデルは「全部見た」前提で次の呼び出しを組み立てて失敗する)。"""
+    if MAX_OBS_CHARS <= 0 or len(text) <= MAX_OBS_CHARS:
+        return text
+    return text[:MAX_OBS_CHARS] + f"\n...[{len(text) - MAX_OBS_CHARS} 文字省略]"
+
+
 class BFCLMultiTurnTool(BaseTool):
     """1 ターン分の BFCL 関数呼び出しをまとめて実行するツール。"""
 
@@ -172,7 +187,7 @@ class BFCLMultiTurnTool(BaseTool):
         process = n_ok / len(tool_calls)
         sess["process_rewards"].append(process)
 
-        observation = "\n".join(outputs)
+        observation = _truncate_obs("\n".join(outputs))
         metrics = {"n_calls": len(tool_calls), "n_ok": n_ok, "process": process}
         return observation, process, metrics
 

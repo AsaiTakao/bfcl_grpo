@@ -11,7 +11,9 @@ adapter と tokenizer/config だけを上げる。
   2. contents="full" では allow_patterns を渡さない(従来どおり全部上げる)
   3. lora 指定なのに lora_adapter が無い checkpoint は push しない
      (黙って 80GB を上げてしまわないため)
-  4. lora 指定のとき mode_restore は何もしない(optimizer 状態が無く resume 不可)
+  4. lora 指定のとき mode_restore は checkpoint を復元しない
+     (optimizer 状態が無く resume 不可)。ログ・val 履歴だけは戻す
+     → tests/test_log_upload.py::RestoreLogTest
 
 実行: python -m pytest tests/test_lora_only_push.py(HF への実通信なし)
 """
@@ -107,15 +109,24 @@ class LoraOnlyPushTest(unittest.TestCase):
 
 
 class LoraRestoreTest(unittest.TestCase):
-    def test_restore_is_noop_for_lora_contents(self) -> None:
-        """adapter しか無い repo から resume を試みない。"""
+    def test_restore_does_not_fetch_checkpoint_for_lora_contents(self) -> None:
+        """adapter しか無い repo から checkpoint の resume を試みない。
+
+        DL してよいのは train.log と val_metrics.jsonl だけ(ログを戻さないと
+        HF 上の前回起動分を空ログで上書きしてしまう)。global_step_* や
+        latest_checkpointed_iteration.txt を掴むと resume_mode=auto が壊れる。
+        """
+        requested: list[list[str]] = []
         fake_hub = types.ModuleType("huggingface_hub")
 
-        def _boom(*a, **k):  # 呼ばれたら失敗させる
-            raise AssertionError("lora push では restore を試みてはいけない")
+        def _boom(*a, **k):  # HfApi は使ってはいけない(checkpoint 列挙用)
+            raise AssertionError("lora push では checkpoint の restore を試みない")
+
+        def _snapshot(*, allow_patterns, **k) -> None:
+            requested.append(list(allow_patterns))
 
         fake_hub.HfApi = _boom
-        fake_hub.snapshot_download = _boom
+        fake_hub.snapshot_download = _snapshot
         saved = sys.modules.get("huggingface_hub")
         sys.modules["huggingface_hub"] = fake_hub
         try:
@@ -125,6 +136,9 @@ class LoraRestoreTest(unittest.TestCase):
                 args = Namespace(ckpt_dir=d, repo_id="user/repo",
                                  prefix="checkpoints", contents="lora")
                 self.assertEqual(up.mode_restore(args, token=None), 0)
+                self.assertEqual(
+                    sorted(p for pats in requested for p in pats),
+                    ["checkpoints/train.log", "checkpoints/val_metrics.jsonl"])
         finally:
             if saved is None:
                 sys.modules.pop("huggingface_hub", None)

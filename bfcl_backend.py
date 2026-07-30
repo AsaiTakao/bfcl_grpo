@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import ast
 import copy
+import difflib
 import importlib
 from typing import Any, Dict, List, Tuple
 
@@ -41,8 +42,12 @@ _FALLBACK_CLASS_MODULE = {
 STATELESS_CLASSES = {"MathAPI"}
 
 
-def _class_module_mapping() -> Dict[str, str]:
-    """bfcl_eval が提供するマッピングを優先し、無ければフォールバックを返す。"""
+def class_module_mapping() -> Dict[str, str]:
+    """bfcl_eval が提供するマッピングを優先し、無ければフォールバックを返す。
+
+    実行時のクラス解決に加えて、prompt 構築側(bfcl_dataset_and_interaction)が
+    multi_turn_func_doc のファイル名(= 実装モジュール名)を引くのにも使う。
+    """
     for path, attr in [
         ("bfcl_eval.constants.default_prompts", "CLASS_FILE_PATH_MAPPING"),
         ("bfcl_eval.constants.category_mapping", "CLASS_FILE_PATH_MAPPING"),
@@ -67,7 +72,7 @@ def load_involved_classes(
     instances : {ClassName: instance}
     namespace : {method_name: bound_method}  (呼び出し実行用)
     """
-    mapping = _class_module_mapping()
+    mapping = class_module_mapping()
     initial_config = initial_config or {}
     instances: Dict[str, Any] = {}
     namespace: Dict[str, Any] = {}
@@ -102,6 +107,29 @@ def load_involved_classes(
     return instances, namespace
 
 
+# 未定義関数エラーの observation に載せる候補数。多すぎると tool 応答が
+# max_response_length を食い、think の余地を奪う。
+_HINT_MAX_NAMES = 12
+
+
+def undefined_function_hint(namespace: Dict[str, Any], name: str) -> str:
+    """存在しない関数を呼ばれたときに返す矯正ヒント。
+
+    名前だけ返しても、モデルは同じ幻の関数を次のターンでも呼ぶ。近い名前
+    (無ければ実在する関数名の一部)を見せて、ロールアウト内で正しい名前へ
+    寄せられるようにする。
+    """
+    names = sorted(namespace)
+    if not names:
+        return "このセッションには利用可能な関数がありません。"
+    close = difflib.get_close_matches(name, names, n=5, cutoff=0.6)
+    if close:
+        return "近い名前: " + ", ".join(close)
+    head = names[:_HINT_MAX_NAMES]
+    more = f" ...(全 {len(names)} 件)" if len(names) > len(head) else ""
+    return "利用可能な関数: " + ", ".join(head) + more
+
+
 def execute_structured_call(
     namespace: Dict[str, Any], name: str, arguments: Dict[str, Any] | None
 ) -> Tuple[bool, str]:
@@ -109,7 +137,8 @@ def execute_structured_call(
     arguments = arguments or {}
     fn = namespace.get(name)
     if fn is None:
-        return False, f"[error] 未定義の関数: {name}"
+        return False, (f"[error] 未定義の関数: {name} / "
+                       f"{undefined_function_hint(namespace, name)}")
     try:
         result = fn(**arguments)
         return True, _render(result)
@@ -191,6 +220,8 @@ def compare_states(
 
 __all__ = [
     "STATELESS_CLASSES",
+    "class_module_mapping",
+    "undefined_function_hint",
     "load_involved_classes",
     "execute_structured_call",
     "execute_gt_string",

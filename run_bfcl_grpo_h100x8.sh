@@ -38,14 +38,24 @@ ACTOR_OPTIM_OFFLOAD="${ACTOR_OPTIM_OFFLOAD:-False}"
 # multi_turn は 1 rollout が複数生成。長め context に備える。
 TRAIN_BATCH="${TRAIN_BATCH:-128}"                 # プロンプト数/step
 PPO_MINI_BATCH="${PPO_MINI_BATCH:-32}"
-MICRO_BATCH_PER_GPU="${MICRO_BATCH_PER_GPU:-4}"   # 8B + multi_turn は控えめに
+# 8B + multi_turn は控えめに。MAX_PROMPT/RESPONSE_LEN を上げたぶん 1 系列の
+# activation が増えるので、OOM が出たらまずここを下げる(次に ACTOR_*_OFFLOAD)。
+MICRO_BATCH_PER_GPU="${MICRO_BATCH_PER_GPU:-4}"
 # log_prob 再計算(ref / rollout)の micro batch。verl は actor.use_dynamic_bsz=False の
 # とき ref と rollout の両方に log_prob_micro_batch_size(_per_gpu) を要求する
 # (未設定だと _validate_config が ValueError で落ちる)。前向き計算のみなので
 # 学習側より大きくできるが、既定は MICRO_BATCH_PER_GPU に揃えて OOM を避ける。
 LOG_PROB_MICRO_BATCH_PER_GPU="${LOG_PROB_MICRO_BATCH_PER_GPU:-${MICRO_BATCH_PER_GPU}}"
-MAX_PROMPT_LEN="${MAX_PROMPT_LEN:-4096}"          # 初期 config。long_context は別枠で拡張。
-MAX_RESPONSE_LEN="${MAX_RESPONSE_LEN:-2048}"      # 1ターンの think+tool_call 長
+# system prompt に involved_classes の全関数シグネチャを載せる(以前は空だった)。
+# GorillaFileSystem + TravelAPI のような 2 クラス構成で数千トークンになるため、
+# 4096 だと filter_overlong_prompts=True に静かに落とされる行が出る。
+MAX_PROMPT_LEN="${MAX_PROMPT_LEN:-8192}"
+# verl の multi_turn ロールアウトでは max_response_length は「1 ターン」ではなく
+# トラジェクトリ全体(全 assistant ターンの think+tool_call と tool 応答の合計)の
+# 予算。2048 では Qwen3 の think 数ターン分で尽き、response_length/clip_ratio が
+# 0.19〜0.47 に達していた。打ち切られた応答は tool_call が壊れて報酬 0 になり、
+# 「正しく動いたが長かった」ロールアウトを負例として学習してしまう。
+MAX_RESPONSE_LEN="${MAX_RESPONSE_LEN:-8192}"
 GROUP_SIZE="${GROUP_SIZE:-8}"                     # GRPO の G。H100 x8 なら 8〜16 可
 # 学習スケジュール(env 上書き可)。
 # 総 step 数は小さい: BFCL multi_turn 3 カテゴリ = 600 件、val 10% を引いて

@@ -62,8 +62,13 @@ TOOLS: List[Dict[str, Any]] = [
 
 SYSTEM = (
     "あなたはツールを使うエージェントです。必要な操作はツール呼び出しで行い、"
-    "推測で答えないでください。"
+    "推測で答えないでください。思考は簡潔に。"
 )
+
+#: 1 応答あたりの生成上限。Qwen3 の think は数百〜千トークンに達するため、
+#: ここが小さいと finish_reason="length" で tool_call まで到達せず、
+#: 「think がパーサを壊した」のか「単に切れた」のか区別できない偽 FAIL になる。
+MAX_TOKENS = int(os.getenv("PHASE0_MAX_TOKENS", "2048"))
 
 
 def _has_think_leak(content: str | None) -> bool:
@@ -108,7 +113,7 @@ def run(base_url: str, model: str, api_key: str, max_turns: int) -> int:
         try:
             resp = client.chat.completions.create(
                 model=model, messages=messages, tools=TOOLS,
-                temperature=0.6, max_tokens=1024,
+                temperature=0.6, max_tokens=MAX_TOKENS,
             )
         except Exception as e:  # noqa: BLE001
             print(f"[phase0] 推論リクエスト失敗: {e}", file=sys.stderr)
@@ -122,6 +127,12 @@ def run(base_url: str, model: str, api_key: str, max_turns: int) -> int:
 
         print(f"[phase0] turn={turn} think={'有' if reasoning else '無/本文'} "
               f"leak={leaked} tool={tc_info}")
+
+        # 打ち切りは「パース破損」と原因が違うので切り分けて報告する。
+        if getattr(resp.choices[0], "finish_reason", None) == "length":
+            print(f"[phase0] 注意: 応答が max_tokens={MAX_TOKENS} で打ち切られました"
+                  "(PHASE0_MAX_TOKENS で調整)。tool_call が欠けるのはこれが原因の"
+                  "可能性があります。")
 
         # 破損パターン: think が本文に漏れ、かつ tool_calls が取れていない。
         if leaked and not tc_ok:

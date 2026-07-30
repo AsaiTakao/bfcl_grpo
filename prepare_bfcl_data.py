@@ -111,6 +111,34 @@ def _split_by_holdout(rows: list, holdout: set) -> tuple:
     return val, train
 
 
+# プロンプト長の見積り係数。関数一覧(英語 schema + 日本語指示)は
+# 1 トークン ≒ 3 文字程度。厳密さは要らず、桁が合っていればよい。
+_CHARS_PER_TOKEN = 3.0
+#: run_bfcl_grpo_h100x8.sh の MAX_PROMPT_LEN 既定値。
+_MAX_PROMPT_TOKENS_HINT = 8192
+
+
+def _report_prompt_size(rows: list, limit_tokens: int = _MAX_PROMPT_TOKENS_HINT) -> None:
+    """プロンプト長を報告する。
+
+    なぜ: system prompt に involved_classes の全関数シグネチャを載せるように
+    したため、プロンプトが数千トークンになる。data.max_prompt_length を超えた行は
+    filter_overlong_prompts=True によって学習時に静かに捨てられるので、
+    データ準備の時点で気付けるようにしておく。
+    """
+    if not rows:
+        return
+    chars = [sum(len(m.get("content", "")) for m in r["prompt"]) for r in rows]
+    est = [c / _CHARS_PER_TOKEN for c in chars]
+    over = sum(1 for t in est if t > limit_tokens)
+    print(f"prompt 長: 平均 {sum(chars)//len(chars)} 文字 / 最大 {max(chars)} 文字 "
+          f"(≒ {max(est):.0f} tok)")
+    if over:
+        print(f"[warn] max_prompt_length={limit_tokens} を超えそうな行が {over} 件あります。"
+              "filter_overlong_prompts=True だと学習時に静かに捨てられます。"
+              "MAX_PROMPT_LEN を上げてください。")
+
+
 def main():
     import pandas as pd
 
@@ -206,6 +234,8 @@ def main():
     val = mt_val + st_val
     rng.shuffle(train)
     rng.shuffle(val)
+
+    _report_prompt_size(train + val)
 
     train_path = os.path.join(args.out_dir, "bfcl_mt_train.parquet")
     val_path = os.path.join(args.out_dir, "bfcl_mt_val.parquet")

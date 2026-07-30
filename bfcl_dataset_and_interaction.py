@@ -23,6 +23,8 @@ import os
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
+import bfcl_backend as backend
+
 try:
     from verl.interactions.base import BaseInteraction  # type: ignore
 except Exception:  # noqa: BLE001  ローカル単体テスト用フォールバック
@@ -37,6 +39,15 @@ TOOL_NAME = "bfcl_multi_turn_call"       # bfcl_tool_config.yaml の function.na
 INTERACTION_NAME = "bfcl"                # interaction_kwargs["name"] と一致させる
 
 _PREFIX_RE = re.compile(r"^(BFCL_v\d+)_.+\.json$")
+
+
+class FuncDocNotFoundError(RuntimeError):
+    """involved class の関数ドキュメントが解決できない。
+
+    カテゴリ欠損(バージョン差)とは違い、これは黙って飛ばしてはいけない。
+    prepare_bfcl_data._load は OSError / KeyError / ValueError を「そのカテゴリは
+    存在しない」として警告付きスキップするため、その網に掛からない型にしている。
+    """
 
 
 def detect_version_prefix(bfcl_data_dir: str) -> str:
@@ -88,41 +99,175 @@ def _read_json_or_jsonl(path: str) -> List[dict]:
         return [json.loads(line) for line in text.splitlines() if line.strip()]
 
 
-def _load_func_docs(bfcl_data_dir: str, involved_classes: List[str]) -> List[dict]:
-    """involved_classes の関数ドキュメント(OpenAI 互換 schema)を結合して返す。
+_FUNC_DOC_DIRNAME = "multi_turn_func_doc"
 
-    見つからないクラスは黙ってスキップ(バージョン差で場所が変わるため)。
+# 読み込んだ func doc のキャッシュ(パス -> schema list)。同じクラスが数百
+# エントリで再登場するため、毎回 JSON を読み直すのを避ける。
+_FUNC_DOC_CACHE: Dict[str, List[dict]] = {}
+
+
+def _camel_to_snake(name: str) -> str:
+    s = re.sub(r"(.)([A-Z][a-z]+)", r"\1_\2", name)
+    return re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", s).lower()
+
+
+def _doc_basenames(cls_name: str) -> List[str]:
+    """involved class 名から func doc ファイル名(拡張子なし)の候補を優先順に返す。
+
+    BFCL の multi_turn_func_doc は「クラス名」ではなく「実装モジュール名」で
+    置かれている:
+        GorillaFileSystem  -> gorilla_file_system.json
+        TwitterAPI         -> posting_api.json
+        TravelAPI          -> travel_booking.json
+        VehicleControlAPI  -> vehicle_control.json
+    以前は `{クラス名}.json` を探して必ず外し、しかも欠損を黙ってスキップして
+    いたため、全エントリが「関数一覧が空」の system prompt で学習していた
+    (モデルは関数名を推測するしかなく undefined function を量産する)。
+
+    候補の優先順:
+      1) bfcl_eval の CLASS_FILE_PATH_MAPPING のモジュール名(実データと一致)
+      2) クラス名の機械的な snake_case 化(将来の新クラス向け)
+      3) クラス名そのまま
     """
+    cands = []
+    module_path = backend.class_module_mapping().get(cls_name)
+    if module_path:
+        # 値は dotted module path("...func_source_code.gorilla_file_system")だが、
+        # バージョンによってファイルパス表記のこともあるので両方から名前を取る。
+        stem = os.path.basename(str(module_path).replace("\\", "/"))
+        if stem.endswith(".py"):
+            stem = stem[: -len(".py")]
+        cands.append(stem.rsplit(".", 1)[-1])
+    cands.append(_camel_to_snake(cls_name))
+    cands.append(cls_name)
+    # 重複を除きつつ順序は維持する。
+    return list(dict.fromkeys(c for c in cands if c))
+
+
+def func_doc_dir(bfcl_data_dir: str) -> Optional[str]:
+    """multi_turn_func_doc ディレクトリの実パス。見つからなければ None。"""
+    parent = os.path.dirname(os.path.normpath(bfcl_data_dir))
+    for cand in (os.path.join(bfcl_data_dir, _FUNC_DOC_DIRNAME),
+                 os.path.join(parent, _FUNC_DOC_DIRNAME)):
+        if os.path.isdir(cand):
+            return cand
+    return None
+
+
+def _load_func_docs(bfcl_data_dir: str,
+                    involved_classes: List[str]) -> Tuple[List[dict], List[str]]:
+    """involved_classes の関数ドキュメント(OpenAI 互換 schema)を結合する。
+
+    戻り値は (schema list, 解決できなかったクラス名 list)。
+    """
+    doc_dir = func_doc_dir(bfcl_data_dir)
     docs: List[dict] = []
-    doc_dir = os.path.join(bfcl_data_dir, "multi_turn_func_doc")
+    missing: List[str] = []
     for cls in involved_classes:
-        p = os.path.join(doc_dir, f"{cls}.json")
-        if os.path.exists(p):
-            try:
-                docs.extend(_read_json_or_jsonl(p))
-            except Exception:  # noqa: BLE001
+        loaded: Optional[List[dict]] = None
+        for base in ([] if doc_dir is None else _doc_basenames(cls)):
+            path = os.path.join(doc_dir, f"{base}.json")
+            if path in _FUNC_DOC_CACHE:
+                loaded = _FUNC_DOC_CACHE[path]
+                break
+            if not os.path.exists(path):
                 continue
-    return docs
+            try:
+                loaded = [d for d in _read_json_or_jsonl(path) if isinstance(d, dict)]
+            except (OSError, json.JSONDecodeError):
+                continue
+            _FUNC_DOC_CACHE[path] = loaded
+            break
+        if loaded:
+            docs.extend(loaded)
+        else:
+            missing.append(cls)
+    return docs, missing
+
+
+def _require_func_docs(bfcl_data_dir: str, involved_classes: List[str],
+                       entry_id: str) -> List[dict]:
+    """func doc を読む。1 クラスでも解決できなければ即座に落とす。
+
+    黙ってスキップすると「関数一覧が空のプロンプト」で学習が完走してしまい、
+    undefined function だらけの報酬 0 ロールアウトに GPU 時間を丸ごと溶かす。
+    データ準備の時点で止める方が安い。
+    """
+    docs, missing = _load_func_docs(bfcl_data_dir, involved_classes)
+    if not missing:
+        return docs
+
+    doc_dir = func_doc_dir(bfcl_data_dir)
+    tried = [f"{b}.json" for c in missing for b in _doc_basenames(c)]
+    if doc_dir is None:
+        where = (f"{os.path.join(bfcl_data_dir, _FUNC_DOC_DIRNAME)} "
+                 "(ディレクトリ自体が見つかりません)")
+        listing: List[str] = []
+    else:
+        where = doc_dir
+        listing = sorted(f for f in os.listdir(doc_dir) if f.endswith(".json"))
+    raise FuncDocNotFoundError(
+        f"[{entry_id}] 関数ドキュメントを解決できないクラスがあります: {missing}\n"
+        f"  探した場所: {where}\n"
+        f"  試したファイル名: {tried}\n"
+        f"  実在するファイル: {listing}\n"
+        "関数一覧が空の system prompt で学習すると、モデルは関数名を推測するしか"
+        "なく undefined function を量産します。--bfcl-data-dir を確認してください。"
+    )
+
+
+# 1 関数あたりの description の上限。BFCL の description は引数の説明まで含んで
+# 長いものがあり、そのまま全関数を並べると max_prompt_length を超える。超えた行は
+# filter_overlong_prompts に静かに落とされて学習から消えるため、ここで抑える。
+_MAX_DESC_CHARS = 240
+
+
+def _format_func_doc(d: dict) -> str:
+    """関数 schema を 1 行のシグネチャに落とす。
+
+    引数名だけでなく型と必須/省略可も出す。名前だけだと引数の当てずっぽうが
+    残り、実行時例外(= process 報酬 0)になる。
+    """
+    name = d.get("name", "?")
+    params = d.get("parameters") if isinstance(d.get("parameters"), dict) else {}
+    props = params.get("properties") if isinstance(params.get("properties"), dict) else {}
+    required = set(params.get("required") or [])
+
+    args = []
+    for arg_name, spec in (props or {}).items():
+        typ = (spec.get("type") if isinstance(spec, dict) else None) or "any"
+        # 省略可能な引数は "名前?" と表記する(表記の意味は system prompt 冒頭で説明)。
+        args.append(f"{arg_name}{'' if arg_name in required else '?'}: {typ}")
+
+    desc = " ".join((d.get("description") or "").split())
+    if len(desc) > _MAX_DESC_CHARS:
+        desc = desc[:_MAX_DESC_CHARS].rstrip() + "…"
+    sig = f"- {name}({', '.join(args)})"
+    return f"{sig}: {desc}" if desc else sig
 
 
 def _system_prompt(func_docs: List[dict]) -> str:
     """利用可能な BFCL 関数一覧を明示し、ラッパツールでの呼び出し方を指示する。"""
+    if not func_docs:
+        # ここを通してしまうと「関数一覧が空」のまま学習が走る。呼び出し側
+        # (_require_func_docs / シングルターンの空 schema スキップ)で防ぐ前提。
+        raise ValueError("func_docs が空です: 関数一覧なしのプロンプトは作れません")
+
     lines = [
         "あなたはツールを使ってユーザーの要求を段階的に達成するエージェントです。",
-        "利用可能なバックエンド関数は以下です(名前と引数):",
+        "利用可能なバックエンド関数は以下です(`引数名?` は省略可能な引数):",
         "",
     ]
-    for d in func_docs:
-        name = d.get("name", "?")
-        desc = (d.get("description", "") or "").strip().replace("\n", " ")
-        params = d.get("parameters", {}).get("properties", {})
-        arg_names = ", ".join(params.keys())
-        lines.append(f"- {name}({arg_names}): {desc}")
+    lines += [_format_func_doc(d) for d in func_docs]
     lines += [
         "",
         f"1 ターンで必要な呼び出しを、ツール `{TOOL_NAME}` の引数",
         '`tool_calls`(= [{"name": 関数名, "arguments": {引数}} , ...])として渡してください。',
+        "関数名は必ず上の一覧から選んでください(一覧に無い名前はエラーになります)。",
         "情報が不足している場合は勝手に仮定せず、ユーザーに質問してください。",
+        # 応答長の打ち切り対策。think が長いと tool_call まで到達せず、
+        # 壊れた出力は報酬 0 になって学習を濁す。
+        "思考は簡潔に(数文以内)。迷い続けず、まず必要な関数呼び出しを出してください。",
     ]
     return "\n".join(lines)
 
@@ -209,7 +354,7 @@ def build_verl_dataset(category: str, bfcl_data_dir: str,
         long_context = "long_context" in category
         gt = answers.get(eid, {}).get("ground_truth", [])
 
-        func_docs = _load_func_docs(bfcl_data_dir, involved)
+        func_docs = _require_func_docs(bfcl_data_dir, involved, eid)
         first_user = _turn_user_text(turns[0]) if turns else ""
         remaining_turns = [_turn_user_text(t) for t in turns[1:]]
 
@@ -276,12 +421,19 @@ def _build_single_turn_dataset(category: str, bfcl_data_dir: str,
     answers = {a["id"]: a for a in _read_json_or_jsonl(a_path)}
 
     rows: List[dict] = []
+    n_no_docs = 0
     for entry in questions:
         eid = entry["id"]
         turns = entry.get("question", [])
         func_docs = entry.get("function", []) or []
         if isinstance(func_docs, dict):      # 単一関数が dict で来る版に耐える
             func_docs = [func_docs]
+        func_docs = [d for d in func_docs if isinstance(d, dict) and d.get("name")]
+        if not func_docs:
+            # 関数一覧が空のプロンプトはモデルに名前を推測させるだけで、
+            # 報酬 0 の undefined function しか生まない。学習に混ぜない。
+            n_no_docs += 1
+            continue
 
         gt = answers.get(eid, {}).get("ground_truth", [])
         if not gt:
@@ -329,6 +481,8 @@ def _build_single_turn_dataset(category: str, bfcl_data_dir: str,
                 },
             }
         )
+    if n_no_docs:
+        print(f"[warn] {category}: 関数 schema が無い {n_no_docs} 件を除外しました")
     return rows
 
 
@@ -384,4 +538,5 @@ class BFCLInteraction(BaseInteraction):
 
 
 __all__ = ["build_verl_dataset", "is_multi_turn_category",
-           "detect_version_prefix", "available_categories", "BFCLInteraction"]
+           "detect_version_prefix", "available_categories", "func_doc_dir",
+           "FuncDocNotFoundError", "BFCLInteraction"]

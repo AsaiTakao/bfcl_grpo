@@ -27,6 +27,19 @@ import train_monitor
 from bfcl_dataset_and_interaction import available_categories as di_available
 
 
+def write_func_docs(data_dir: str, docs_by_basename: dict) -> str:
+    """multi_turn_func_doc/<basename>.json を書き出す(テスト用の合成データ)。"""
+    import json
+
+    doc_dir = os.path.join(data_dir, "multi_turn_func_doc")
+    os.makedirs(doc_dir, exist_ok=True)
+    for basename, docs in docs_by_basename.items():
+        with open(os.path.join(doc_dir, f"{basename}.json"), "w",
+                  encoding="utf-8") as f:
+            json.dump(docs, f)
+    return doc_dir
+
+
 # --------------------------------------------------------------- ast_match
 class AstMatchTest(unittest.TestCase):
     def test_exact_single_call(self) -> None:
@@ -297,6 +310,13 @@ class ParquetSchemaTest(unittest.TestCase):
         ]
         mt_a = [{"id": "multi_turn_base_0", "ground_truth": [["f(a=1)"], ["g()"]]},
                 {"id": "multi_turn_base_1", "ground_truth": [["h(x=2)"]]}]
+        # func doc はクラス名ではなく実装モジュール名で置かれている(BFCL の実配置)。
+        write_func_docs(self.tmp.name, {
+            "gorilla_file_system": [{"name": "f", "description": "",
+                                     "parameters": {"properties": {"a": {}}}}],
+            "trading_bot": [{"name": "h", "description": "",
+                             "parameters": {"properties": {"x": {}}}}],
+        })
         st_q = [{"id": "simple_0",
                  "question": [[{"role": "user", "content": "d"}]],
                  "function": [{"name": "w", "description": "",
