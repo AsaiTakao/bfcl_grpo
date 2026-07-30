@@ -37,6 +37,7 @@ BFCL multi_turn ──GRPO(verl/LoRA r=32)──▶ checkpoint ──▶ merge(H
 | `bfcl_multiturn_grpo.yaml` / `bfcl_tool_config.yaml` / `bfcl_interaction_config.yaml` | verl 設定 |
 | `run_bfcl_grpo_h100x8.sh` | 学習起動(env 駆動、LoRA r=32、resume_mode=auto) |
 | `verl_lora_sglang_patch.py` | sglang へ重みを同期する直前に LoRA を base へマージする verl パッチ |
+| `dep_fixup.py` | 起動時に依存ピン(peft/compressed-tensors 等)のズレを検査し入れ直す |
 | `train_monitor.py` | train.log 監視: val 指標抽出・EarlyStopping(patience=3)・λ 減衰用 step 供給 |
 | `hf_checkpoint_uploader.py` | 200step ごと HF push(最良3+直近3保持)/ resume 復元 / merge 版最終 push |
 | `Dockerfile` / `entrypoint.sh` | 学習イメージ(sglang) |
@@ -153,7 +154,9 @@ git clone → HF から最新 checkpoint を restore(resume)→ 背景アップ�
 `HOLDOUT_CLASSES`(=TravelAPI,VehicleControlAPI)
 `ST_REGRESSION_WEIGHT`(=1.0)`ST_REGRESSION_TOL`(=0.05)
 `EARLY_STOP`/`EARLY_STOP_PATIENCE`(=1/3)`KEEP_BEST`/`KEEP_LATEST`(=3/3)
-`RESUME_FROM_HF`(=1)`MERGE_FINAL`(=1)。
+`RESUME_FROM_HF`(=1)`MERGE_FINAL`(=1)
+`DEP_FIXUP`(=1。依存ピンの自己修復)`LOG_PROB_MICRO_BATCH_PER_GPU`
+(=MICRO_BATCH_PER_GPU)。
 
 ---
 
@@ -242,7 +245,10 @@ DOCKER_BUILDKIT=1 docker build -f Dockerfile.eval -t <registry>/bfcl-eval:latest
   `compressed-tensors>=0.16` は import 時に `transformers.masking_utils`
   (4.52 以降)を参照して `import sglang` 経路が ModuleNotFoundError。
   ビルド時 import 検査でこの 2 つを再現するようにしてあるので、
-  GPU 課金前(CPU ビルド)に検出できる。
+  GPU 課金前(CPU ビルド)に検出できる。加えて、**古いイメージで起動しても
+  `dep_fixup.py` が学習開始前に入れ直す**(学習コードは実行時 clone なので
+  再ビルドを待たずに効く)。直せない場合は GPU を掴む前に停止する。
+  `DEP_FIXUP=0` で無効化、`DEP_PIN_PEFT` 等で個別のピンを上書き。
 - **LoRA + sglang rollout は verl 0.4.1 単体では動かない**(検証済み)。verl の
   LoRA 配線は vLLM 経路にしか無く、`fsdp_sglang.py` は PEFT ラップの解除も
   adapter の merge もせずに `state_dict()` を sglang へ push するため、最初の

@@ -117,6 +117,19 @@ if [[ -n "${ROLLOUT_EXTRA_ARGS:-}" ]]; then
   EXTRA_ARGS+=( ${ROLLOUT_EXTRA_ARGS} )
 fi
 
+# --- 依存バージョンの自己修復 -------------------------------------------------
+# 古いイメージ(peft / compressed-tensors が最新版のまま焼かれたもの)で起動しても
+# ここで直る。学習コードは実行時 clone なので、イメージ再ビルドを待たずに効く。
+# 直せなかった場合は GPU を掴む前に落とす(rollout が base 重みで回る事故を防ぐ)。
+# 詳細は dep_fixup.py の docstring。DEP_FIXUP=0 で無効化。
+if [[ "${DEP_FIXUP:-1}" == "1" ]]; then
+  python3 "${PROJECT_DIR}/dep_fixup.py" || {
+    echo "[run] ERROR: 依存バージョンの整合に失敗しました。" >&2
+    echo "[run]        Dockerfile の『依存の整合』レイヤーを含めて再ビルドしてください。" >&2
+    exit 1
+  }
+fi
+
 python3 -m verl.trainer.main_ppo \
     --config-path="${CONFIG_DIR}" \
     --config-name='bfcl_multiturn_grpo' \
