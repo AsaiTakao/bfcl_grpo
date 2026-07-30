@@ -145,6 +145,13 @@ RUN --mount=type=secret,id=hf_token \
 # 注意: ここで値を焼くと run script 側の既定(${VAR:-default})より優先される。
 # 既定を 1 箇所に保つため、run script と同じ値だけを書くこと。
 # UPLOAD_EVERY は意図的に焼かない(未設定なら SAVE_FREQ に追従する設計)。
+#
+# 同期漏れの実例(再発させないこと): MAX_PROMPT_LEN / MAX_RESPONSE_LEN を
+# run script 側だけ 4096/2048 → 8192/8192 に直したことがあり、ここに焼いた
+# 古い値が勝って修正が無効化された。プロンプトへ関数一覧を載せる変更や
+# 応答長の調整を入れたら、必ずこのブロックも同じ値へ更新すること
+# (症状は静かで、filter_overlong_prompts による行の欠落と
+#  response_length/clip_ratio の上昇としてしか現れない)。
 ENV CODE_REPO="" \
     CODE_REF="main" \
     CODE_DIR=/workspace/code \
@@ -163,8 +170,8 @@ ENV CODE_REPO="" \
     TRAIN_BATCH=128 \
     PPO_MINI_BATCH=32 \
     MICRO_BATCH_PER_GPU=4 \
-    MAX_PROMPT_LEN=4096 \
-    MAX_RESPONSE_LEN=2048 \
+    MAX_PROMPT_LEN=8192 \
+    MAX_RESPONSE_LEN=8192 \
     GROUP_SIZE=8 \
     LORA_RANK=32 \
     LORA_ALPHA=32 \

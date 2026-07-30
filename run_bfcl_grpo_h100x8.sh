@@ -132,6 +132,34 @@ if [[ -n "${ROLLOUT_EXTRA_ARGS:-}" ]]; then
   EXTRA_ARGS+=( ${ROLLOUT_EXTRA_ARGS} )
 fi
 
+# --- ロガー ------------------------------------------------------------------
+# wandb は非 tty で API キーが無いと wandb.init が失敗し、学習が起動直後に落ちる
+# (GPU を掴む前でもなく、Ray worker 起動後に落ちるので原因が分かりにくい)。
+# キーが無い環境でそれを踏まないよう、未設定なら console だけに落とす。
+#
+# console は常に含める: train_monitor は console logger の
+# `step:N - key:value` 形式を正規表現で読んで eval 抽出と EarlyStopping を
+# 行うため、これを外すと早期終了と val 記録が丸ごと機能しなくなる。
+#
+#   TRAINER_LOGGER  明示指定(例 "[console]" / "[console,wandb]")。指定時はそのまま使う
+#   WANDB_API_KEY   あれば wandb を有効化
+#   WANDB_MODE=offline  キー無しでも wandb を使える(後から wandb sync で送る)
+if [[ -n "${TRAINER_LOGGER:-}" ]]; then
+  LOGGER="${TRAINER_LOGGER}"
+elif [[ -n "${WANDB_API_KEY:-}" || "${WANDB_MODE:-}" == "offline" ]]; then
+  LOGGER="[console,wandb]"
+else
+  echo "[run] WANDB_API_KEY 未設定のため logger=[console] で実行します" >&2
+  echo "[run]        wandb に残すには WANDB_API_KEY、オフライン記録なら" >&2
+  echo "[run]        WANDB_MODE=offline を設定してください。" >&2
+  LOGGER="[console]"
+fi
+if [[ "${LOGGER}" != *console* ]]; then
+  echo "[run] WARN: logger に console が無いため train.log に指標が出ません。" >&2
+  echo "[run]       EarlyStopping と val_metrics.jsonl の記録が機能しません。" >&2
+fi
+echo "[run] logger=${LOGGER}"
+
 # --- 依存バージョンの自己修復 -------------------------------------------------
 # 古いイメージ(peft / compressed-tensors が最新版のまま焼かれたもの)で起動しても
 # ここで直る。学習コードは実行時 clone なので、イメージ再ビルドを待たずに効く。
@@ -185,7 +213,7 @@ python3 -m verl.trainer.main_ppo \
     custom_reward_function.name=compute_score \
     algorithm.use_kl_in_reward=False \
     trainer.critic_warmup=0 \
-    trainer.logger=[console,wandb] \
+    trainer.logger="${LOGGER}" \
     trainer.project_name=bfcl_mt_grpo \
     trainer.experiment_name=qwen3_8b_base_mt_grpo_n${GROUP_SIZE} \
     trainer.n_gpus_per_node=${N_GPUS} \

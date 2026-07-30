@@ -45,12 +45,28 @@ mkdir -p "$(dirname "${BOOT_LOG}")"
 # uploader が HF へ上げるログ(既定は CKPT_DIR 直下の *.log なので、
 # CKPT_DIR 外に置く起動ログは明示的に渡す)。
 : "${HF_LOG_FILES:=${TRAIN_LOG}:${BOOT_LOG}}"
-export CODE_DIR CKPT_DIR TRAIN_LOG LOG_DIR RUN_ID BOOT_LOG HF_LOG_FILES
+# DOK の定義済み環境変数 SAKURA_ARTIFACT_DIR(既定 /opt/artifact)。ここに置いた
+# ファイルはタスク終了後に tar.gz でダウンロードできる = HF push が失敗しても
+# ログを回収できる二重化。ARTIFACT_DIR で明示上書き可、空なら何もしない。
+#
+# checkpoint はここに置かない(CKPT_DIR を向けない):
+#   - artifact は次タスクへ自動で引き継がれないため resume が手作業になる
+#   - 17GB 級の tar.gz 化は終了処理を長引かせ、時間切れの SIGKILL に間に合わない
+#   - bf16 重みは圧縮が効かず CPU 時間だけ損する
+# resume 用の退避先は HF のまま(hf_checkpoint_uploader --mode restore が起動時に
+# 自動取得する)。
+: "${ARTIFACT_DIR:=${SAKURA_ARTIFACT_DIR:-}}"
+export CODE_DIR CKPT_DIR TRAIN_LOG LOG_DIR RUN_ID BOOT_LOG HF_LOG_FILES ARTIFACT_DIR
 # fd 3 = 素のコンソール。train.log の tail はこちらへ流す
 # (tee に流すと起動ログに train.log 全体が二重に入る)。
 exec 3>&1
 exec > >(tee -a "${BOOT_LOG}") 2>&1
 log "起動ログ: ${BOOT_LOG} → HF ${HF_REPO_ID:-(未設定)}/${HF_CKPT_PREFIX:-checkpoints}/$(basename "${BOOT_LOG}")"
+if [[ -n "${ARTIFACT_DIR}" ]]; then
+  log "artifact 退避先: ${ARTIFACT_DIR}/logs (タスク終了後に tar.gz で DL 可)"
+else
+  log "SAKURA_ARTIFACT_DIR 未設定。ログの回収は HF repo のみ。"
+fi
 
 # --- 1) HF トークンをファイルから取得(履歴・レイヤーに残さない)-------------
 # 優先: HF_TOKEN_FILE で指定されたパス → DOK のシークレット既定パス。
@@ -155,15 +171,64 @@ else
   log "HF_REPO_ID 未設定。checkpoint / ログのアップロードは無効。"
 fi
 
+# ログと小さいメタを SAKURA_ARTIFACT_DIR へ複製する(数 MB, 一瞬で終わる)。
+# なぜ final_sync の先頭で呼ぶか: 時間切れは SIGTERM → 猶予 → SIGKILL で来る。
+# 猶予が短いと最終 checkpoint push や FINAL_BUFFER_SECONDS の sleep 中に殺される
+# ため、確実に残したいものを真っ先にコピーしておく。
+# 個々の cp が失敗しても学習の終了処理は止めない(set -e 対策で || true)。
+save_artifacts() {
+  [[ -n "${ARTIFACT_DIR}" ]] || return 0
+  local dst="${ARTIFACT_DIR}/logs"
+  mkdir -p "${dst}" 2>/dev/null || return 0
+  # 書き込み中の train.log をコピーしても構わない(部分的でも読めれば価値がある)。
+  cp -f "${TRAIN_LOG}" "${BOOT_LOG}" "${dst}/" 2>/dev/null || true
+  local f
+  for f in val_metrics.jsonl early_stopped.json global_step.txt; do
+    cp -f "${CKPT_DIR}/${f}" "${dst}/" 2>/dev/null || true
+  done
+  cp -f "${MERGED_DIR:-/workspace/merged/final}/eval_record.json" "${dst}/" \
+    2>/dev/null || true
+  log "artifact へ退避: ${dst} ($1)"
+}
+
+# 終了シグナルを記録する。DOK の時間切れ・停止操作は SIGTERM で来るが、
+# EXIT トラップ内の $? はそのとき 0 になる。記録しないと時間切れが
+# 「exit=0(正常終了)」として HF のコミットメッセージに残り、事後調査で
+# 打ち切りを見落とす。ログを一次資料にする設計の前提が崩れるため記録する。
+EXIT_SIGNAL=""
+on_signal() {
+  EXIT_SIGNAL="$1"
+  log "シグナル $1 を受信しました。終了処理へ移ります。"
+}
+trap 'on_signal SIGTERM' TERM
+trap 'on_signal SIGINT' INT
+
 # 学習が失敗/終了しても必ず最終 push とアップローダ停止を行う。
 final_sync() {
   local code=$?
+  # シグナル終了では $? が 0 になるため、記録した signal から 128+signum を
+  # 復元する(kill された場合の慣例値)。
+  local reason="exit=${code}"
+  if [[ -n "${EXIT_SIGNAL}" ]]; then
+    case "${EXIT_SIGNAL}" in
+      SIGTERM) code=143 ;;   # DOK の時間切れ / 停止操作
+      SIGINT)  code=130 ;;
+      *)       code=1 ;;
+    esac
+    reason="signal=${EXIT_SIGNAL}"
+    log "シグナル ${EXIT_SIGNAL} による終了 (code=${code})。時間切れ・停止操作の可能性があります(学習自身のエラーではありません)。"
+  fi
   # EarlyStopping による停止は正常終了として扱う(monitor がマーカーを残す)。
+  # signal 判定より後に置く: monitor は killpg で学習を止めるため、こちらが
+  # 真の終了理由になる(SIGTERM と同時に成立した場合も早期終了を優先)。
   if [[ ${code} -ne 0 && -f "${CKPT_DIR}/early_stopped.json" ]]; then
     log "EarlyStopping による停止を検知。exit=0 として扱います。"
     code=0
+    reason="early_stopped"
   fi
-  log "学習プロセス終了 (exit=${code})。最終 checkpoint を同期 push します。"
+  # 何よりも先に退避する(以降の push / sleep 中に SIGKILL され得る)。
+  save_artifacts "${reason}"
+  log "学習プロセス終了 (${reason})。最終 checkpoint を同期 push します。"
   if [[ -n "${HF_REPO_ID:-}" ]]; then
     python hf_checkpoint_uploader.py --mode final || log "最終 push 失敗"
     # 設計書: 学習終了後、merge 版 checkpoint を HF へアップロード
@@ -186,9 +251,11 @@ final_sync() {
   # 落ちても)train.log と起動ログは HF に残る。終了理由が載る最後の数十行も
   # このタイミングで初めて確定する。
   if [[ -n "${HF_REPO_ID:-}" ]]; then
-    python hf_checkpoint_uploader.py --mode logs --reason "exit=${code}" \
+    python hf_checkpoint_uploader.py --mode logs --reason "${reason}" \
       || log "ログ push 失敗"
   fi
+  # 最終 push / merge の結果まで含めて撮り直す(先頭で撮った版はここより古い)。
+  save_artifacts "${reason} / final"
   # 非同期送信の完了待ちバッファ(強制終了での取りこぼし防止)。
   log "バッファ待機 ${FINAL_BUFFER_SECONDS:-300}s"
   sleep "${FINAL_BUFFER_SECONDS:-300}"
