@@ -61,6 +61,59 @@ class MismatchedTest(unittest.TestCase):
         self.assertEqual(bad, [("peft", None, "0.15.2")])
 
 
+class OtelPinsTest(unittest.TestCase):
+    """otel は固定値ではなく「入っている sdk の Requires-Dist」から導く。
+
+    なぜ: ray の dashboard agent が opentelemetry.exporter.prometheus を
+    import できないとノード起動が timeout する。正解のリリース列は
+    イメージに焼かれた sdk で変わるので、判断ロジックだけを固定する。
+    """
+
+    SDK_REQUIRES = [
+        "opentelemetry-api==1.37.0",
+        "opentelemetry-semantic-conventions==0.58b0",
+        "typing-extensions>=4.5.0",
+        'importlib-metadata<8.8.0,>=6.0; python_version < "3.13"',
+    ]
+
+    def test_exporter_follows_the_semconv_release_train(self) -> None:
+        want = dep_fixup.otel_pins(self.SDK_REQUIRES)
+        self.assertEqual(want, {
+            "opentelemetry-api": "1.37.0",
+            "opentelemetry-semantic-conventions": "0.58b0",
+            "opentelemetry-exporter-prometheus": "0.58b0",
+        })
+
+    def test_loose_requirements_and_markers_are_ignored(self) -> None:
+        pins = dep_fixup.parse_pinned_requires(self.SDK_REQUIRES)
+        self.assertEqual(set(pins),
+                         {"opentelemetry-api", "opentelemetry-semantic-conventions"})
+
+    def test_extras_are_stripped(self) -> None:
+        pins = dep_fixup.parse_pinned_requires(["opentelemetry-exporter-otlp[grpc]==0.58b0"])
+        self.assertEqual(pins, {"opentelemetry-exporter-otlp": "0.58b0"})
+
+    def test_without_a_semconv_pin_the_exporter_is_left_alone(self) -> None:
+        # 列が決まらないのに exporter を動かすと、直すつもりで壊す。
+        want = dep_fixup.otel_pins(["opentelemetry-api>=1.30"])
+        self.assertEqual(want, {})
+
+    def test_observed_skew_is_reported(self) -> None:
+        # 実機で踏んだ形: semconv だけ古い列に残り、
+        # OtelComponentTypeValues が無くて ray が起動しない。
+        want = dep_fixup.otel_pins(self.SDK_REQUIRES)
+        versions = {
+            "opentelemetry-api": "1.37.0",
+            "opentelemetry-semantic-conventions": "0.55b1",
+            "opentelemetry-exporter-prometheus": "0.58b0",
+        }
+        self.assertEqual(mismatch_names(want, versions),
+                         ["opentelemetry-semantic-conventions"])
+
+    def test_env_can_disable_the_otel_alignment(self) -> None:
+        self.assertEqual(dep_fixup.resolve_otel_pins({"DEP_OTEL_FIX": "0"}), {})
+
+
 def mismatch_names(pins, versions):
     return [package for package, _, _ in dep_fixup.mismatched(pins, versions)]
 

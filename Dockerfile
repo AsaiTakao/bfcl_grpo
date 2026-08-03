@@ -124,6 +124,87 @@ RUN set -e; \
     pip install --force-reinstall "setuptools<81" && \
     python -c "import pkg_resources; print('pkg_resources OK')"
 
+# --- opentelemetry を 1 つのリリース列へ揃える(ray のノード起動条件)----------
+# ray は各ノードで dashboard agent を立て、その中で
+# ray/dashboard/modules/aggregator/aggregator_agent.py が
+# opentelemetry.exporter.prometheus を import する。ここが失敗すると agent が
+# 死に、raylet が「Exception: The current node timed out during startup.」で
+# 落ちる = ray.init() が返らず学習が 1 step も進まない。実機で踏んだ形:
+#   ImportError: cannot import name 'OtelComponentTypeValues'
+#       from 'opentelemetry.semconv._incubating.attributes.otel_attributes'
+#
+# opentelemetry-python は安定版(api/sdk = 1.X.Y)とプレリリース版
+# (semantic-conventions / exporter 群 = 0.(X+21)bZ)を必ず同時に出し、
+# sdk のメタデータが仲間を == で厳密固定する(sdk 1.37.0 → semconv 0.58b0)。
+# 上の pip レイヤー群(sglang / verl / vllm / 依存の整合)はそれぞれ独立に
+# 依存解決するため、どれか 1 つが otel を上げ下げすると列が割れ、新しい側が
+# 古い semconv に無いシンボルを参照して上の ImportError になる。
+#
+# ここに固定値を書かないのは、正しい列がその時に解決された sdk で決まるため。
+# 入っている sdk の Requires-Dist を正として api / semantic-conventions /
+# exporter-prometheus を引き戻す(= 実行時の dep_fixup.py と同じ判断)。
+# 必ず全ての pip レイヤーの後に置くこと(前だと後続に壊される)。
+#
+# sdk の列そのものを移したい場合(ray が新しい otel と合わない等)は
+# --build-arg OTEL_SDK_VERSION=1.37.0 のように指定する。
+ARG OTEL_SDK_VERSION=""
+RUN OTEL_SDK_VERSION="${OTEL_SDK_VERSION}" python - <<'PY'
+import importlib, os, re, subprocess, sys
+from importlib import metadata
+
+def ver(package):
+    try:
+        return metadata.version(package)
+    except metadata.PackageNotFoundError:
+        return None
+
+def pip(*specs):
+    # バージョンだけ動かしたいので --no-deps(新しい torch 等を引き込ませない)。
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "--no-deps", *specs])
+    # 直後の metadata 読み直しが古い値を返さないようにする
+    # (importlib のキャッシュは site-packages の mtime 基準で、解像度は 1 秒)。
+    importlib.invalidate_caches()
+
+want_sdk = os.environ.get("OTEL_SDK_VERSION", "").strip()
+if want_sdk and ver("opentelemetry-sdk") != want_sdk:
+    # 列ごと移す指定なので、ここだけは仲間を連れてこさせる(--no-deps にしない)。
+    subprocess.check_call([sys.executable, "-m", "pip", "install",
+                           f"opentelemetry-sdk=={want_sdk}"])
+
+sdk = ver("opentelemetry-sdk")
+if sdk is None:
+    print("[otel] opentelemetry-sdk 未導入。ray が otel を使わない構成として続行")
+    raise SystemExit(0)
+
+pinned = {}
+for raw in metadata.requires("opentelemetry-sdk") or []:
+    spec = re.sub(r"\[[^\]]*\]", "", raw.split(";")[0]).strip()
+    matched = re.match(r"^([A-Za-z0-9._-]+)\s*==\s*([^\s,;()\[\]]+)$", spec)
+    if matched:
+        pinned[matched.group(1).lower().replace("_", "-")] = matched.group(2)
+
+want = {p: pinned[p] for p in ("opentelemetry-api",
+                               "opentelemetry-semantic-conventions") if p in pinned}
+# exporter 群は semantic-conventions と同じ番号で出る。ray が掴むのは
+# prometheus exporter だけなので、揃えるのもそれだけにする。
+train = want.get("opentelemetry-semantic-conventions")
+if train and ver("opentelemetry-exporter-prometheus") is not None:
+    want["opentelemetry-exporter-prometheus"] = train
+
+print(f"[otel] sdk={sdk} 期待={want}")
+bad = [(p, v) for p, v in want.items() if ver(p) != v]
+if bad:
+    print("[otel] 列のズレを検出: " + ", ".join(f"{p} {ver(p)} -> {v}" for p, v in bad))
+    pip(*[f"{p}=={v}" for p, v in bad])
+print("[otel] 揃え後: " + ", ".join(f"{p}={ver(p)}" for p in want))
+
+# ray の agent が最初に踏む import。ここが通らないイメージは出荷しない。
+if ver("opentelemetry-exporter-prometheus") is not None:
+    subprocess.check_call([sys.executable, "-c",
+                           "import opentelemetry.exporter.prometheus"])
+    print("[otel] opentelemetry.exporter.prometheus import OK")
+PY
+
 # --- ビルド時 import 検査 ------------------------------------------------------
 # 実行時(= GPU 課金中)に初めて import 失敗が発覚するのを防ぐ。ここで落ちたら
 # 依存解決が壊れている(例: torch 引き上げによる flash-attn の ABI 不整合)。
