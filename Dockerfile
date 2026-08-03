@@ -124,29 +124,35 @@ RUN set -e; \
     pip install --force-reinstall "setuptools<81" && \
     python -c "import pkg_resources; print('pkg_resources OK')"
 
-# --- opentelemetry を 1 つのリリース列へ揃える(ray のノード起動条件)----------
-# ray は各ノードで dashboard agent を立て、その中で
-# ray/dashboard/modules/aggregator/aggregator_agent.py が
-# opentelemetry.exporter.prometheus を import する。ここが失敗すると agent が
-# 死に、raylet が「Exception: The current node timed out during startup.」で
-# 落ちる = ray.init() が返らず学習が 1 step も進まない。実機で踏んだ形:
+# --- opentelemetry を ray が動く列へ揃える(ノード起動の前提条件)-------------
+# ray は起動時に dashboard(と各ノードの agent)を立て、その中で
+# ray/dashboard/modules/aggregator/... が opentelemetry でメトリクスを登録する。
+# ここで例外が出るとプロセスが死に、raylet が
+# 「Exception: The current node timed out during startup.」で落ちる
+# = ray.init() が返らず学習が 1 step も進まない。実機で 2 形踏んだ:
 #   ImportError: cannot import name 'OtelComponentTypeValues'
 #       from 'opentelemetry.semconv._incubating.attributes.otel_attributes'
+#   TypeError: Meter.create_histogram() got an unexpected keyword argument
+#       'explicit_bucket_boundaries_advisory'   (← api<1.30 だと出る)
 #
 # opentelemetry-python は安定版(api/sdk = 1.X.Y)とプレリリース版
 # (semantic-conventions / exporter 群 = 0.(X+21)bZ)を必ず同時に出し、
 # sdk のメタデータが仲間を == で厳密固定する(sdk 1.37.0 → semconv 0.58b0)。
 # 上の pip レイヤー群(sglang / verl / vllm / 依存の整合)はそれぞれ独立に
-# 依存解決するため、どれか 1 つが otel を上げ下げすると列が割れ、新しい側が
-# 古い semconv に無いシンボルを参照して上の ImportError になる。
+# 依存解決するため、どれか 1 つが otel を上げ下げすると列が割れる。
 #
-# ここに固定値を書かないのは、正しい列がその時に解決された sdk で決まるため。
-# 入っている sdk の Requires-Dist を正として api / semantic-conventions /
-# exporter-prometheus を引き戻す(= 実行時の dep_fixup.py と同じ判断)。
+# 揃える先を「入っている sdk」にしてはいけない(1 敗)。実機のイメージは
+# api/sdk=1.26.0(2024 年)に対し exporter=0.65b0(= 1.44 列)で、sdk 基準に
+# 揃えたら exporter が 0.47b0 へ落ちて上の TypeError になった。ray は
+# setup.py の extras["default"] で opentelemetry-sdk >= 1.30.0 を宣言しており、
+# そちらが実際の下限になる。よって 2 段階で揃える:
+#   1) ray が宣言する下限を下回っていたら sdk をそこまで上げる(deps 込み)
+#   2) その上で exporter を semantic-conventions と同じ番号へ揃える
 # 必ず全ての pip レイヤーの後に置くこと(前だと後続に壊される)。
 #
-# sdk の列そのものを移したい場合(ray が新しい otel と合わない等)は
-# --build-arg OTEL_SDK_VERSION=1.37.0 のように指定する。
+# 列を明示したい場合は --build-arg OTEL_SDK_VERSION=1.44.0(下限として効く)。
+# 副作用: vllm/sglang の opentelemetry-exporter-otlp-* が古い列に取り残される
+# ことがある。tracing を有効にした時しか import されないので学習には無害。
 ARG OTEL_SDK_VERSION=""
 RUN OTEL_SDK_VERSION="${OTEL_SDK_VERSION}" python - <<'PY'
 import importlib, os, re, subprocess, sys
@@ -165,23 +171,61 @@ def pip(*specs):
     # (importlib のキャッシュは site-packages の mtime 基準で、解像度は 1 秒)。
     importlib.invalidate_caches()
 
-want_sdk = os.environ.get("OTEL_SDK_VERSION", "").strip()
-if want_sdk and ver("opentelemetry-sdk") != want_sdk:
-    # 列ごと移す指定なので、ここだけは仲間を連れてこさせる(--no-deps にしない)。
-    subprocess.check_call([sys.executable, "-m", "pip", "install",
-                           f"opentelemetry-sdk=={want_sdk}"])
+def key(version):
+    from packaging.version import Version
+    return Version(version)
 
-sdk = ver("opentelemetry-sdk")
-if sdk is None:
+def requirements(package, pattern):
+    out = {}
+    for raw in metadata.requires(package) or []:
+        spec = re.sub(r"\[[^\]]*\]", "", raw.split(";")[0]).strip()
+        matched = re.match(pattern, spec)
+        if matched:
+            name = matched.group(1).lower().replace("_", "-")
+            if name not in out or key(matched.group(2)) > key(out[name]):
+                out[name] = matched.group(2)
+    return out
+
+if ver("opentelemetry-sdk") is None:
     print("[otel] opentelemetry-sdk 未導入。ray が otel を使わない構成として続行")
     raise SystemExit(0)
 
-pinned = {}
-for raw in metadata.requires("opentelemetry-sdk") or []:
-    spec = re.sub(r"\[[^\]]*\]", "", raw.split(";")[0]).strip()
-    matched = re.match(r"^([A-Za-z0-9._-]+)\s*==\s*([^\s,;()\[\]]+)$", spec)
-    if matched:
-        pinned[matched.group(1).lower().replace("_", "-")] = matched.group(2)
+# 1) 揃える先(= 一番新しい列)まで sdk を上げる。候補は ray が宣言する下限と、
+#    既に入っているプレリリース版の列(pip が ray のために解決した結果)。
+#    常に新しい方へ寄せるのが肝で、古い方へ引き戻すと ray 向けの列を壊す。
+#    api / semantic-conventions は sdk が == で固定しているので pip に解決させる
+#    (プレリリースの b0/b1 を自前で当てにいかなくて済む)。
+def stable_of(prerelease):
+    matched = re.match(r"^0\.(\d+)b\d+$", prerelease or "")
+    if not matched:
+        return None
+    minor = int(matched.group(1)) - 21   # 1.26↔0.47 / 1.37↔0.58 / 1.44↔0.65
+    return f"1.{minor}.0" if minor >= 0 else None
+
+floor = os.environ.get("OTEL_SDK_VERSION", "").strip()
+if not floor:
+    candidates = []
+    if ver("ray") is not None:
+        ray_min = requirements(
+            "ray", r"^([A-Za-z0-9._-]+)\s*>=\s*([^\s,;()\[\]]+)").get("opentelemetry-sdk")
+        if ray_min:
+            candidates.append(ray_min)
+    for package in ("opentelemetry-exporter-prometheus",
+                    "opentelemetry-semantic-conventions"):
+        stable = stable_of(ver(package))
+        if stable:
+            candidates.append(stable)
+    floor = max(candidates, key=key) if candidates else ""
+if floor and key(ver("opentelemetry-sdk")) < key(floor):
+    print(f"[otel] sdk {ver('opentelemetry-sdk')} は揃える先 {floor} より古い。上げます")
+    subprocess.check_call([sys.executable, "-m", "pip", "install",
+                           f"opentelemetry-sdk=={floor}"])
+    importlib.invalidate_caches()
+
+sdk = ver("opentelemetry-sdk")
+# 2) sdk の == ピンを正として仲間を揃える。
+pinned = requirements("opentelemetry-sdk",
+                      r"^([A-Za-z0-9._-]+)\s*==\s*([^\s,;()\[\]]+)$")
 
 want = {p: pinned[p] for p in ("opentelemetry-api",
                                "opentelemetry-semantic-conventions") if p in pinned}
@@ -198,11 +242,23 @@ if bad:
     pip(*[f"{p}=={v}" for p, v in bad])
 print("[otel] 揃え後: " + ", ".join(f"{p}={ver(p)}" for p in want))
 
-# ray の agent が最初に踏む import。ここが通らないイメージは出荷しない。
-if ver("opentelemetry-exporter-prometheus") is not None:
-    subprocess.check_call([sys.executable, "-c",
-                           "import opentelemetry.exporter.prometheus"])
-    print("[otel] opentelemetry.exporter.prometheus import OK")
+# ray の dashboard / agent が踏むのと同じ経路で検査する。メトリクス登録は
+# モジュール読み込み時に走るので、バージョン不一致は import 時に露見する
+# (opentelemetry.exporter.prometheus 単体の import では上の TypeError を
+#  素通りしてしまう)。ここが通らないイメージは出荷しない。
+if ver("ray") is not None:
+    subprocess.check_call([sys.executable, "-c", (
+        "import importlib, sys\n"
+        "name = 'ray.dashboard.modules.aggregator.aggregator_agent'\n"
+        "try:\n"
+        "    importlib.import_module(name)\n"
+        "except ModuleNotFoundError as e:\n"
+        "    missing = e.name or ''\n"
+        "    if name == missing or name.startswith(missing + '.'):\n"
+        "        print('[otel] ' + name + ' は無いので検査を省略')\n"
+        "        sys.exit(0)\n"
+        "    raise\n"
+        "print('[otel] ' + name + ' import OK')\n")])
 PY
 
 # --- ビルド時 import 検査 ------------------------------------------------------

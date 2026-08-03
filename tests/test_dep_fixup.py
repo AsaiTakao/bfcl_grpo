@@ -114,6 +114,66 @@ class OtelPinsTest(unittest.TestCase):
         self.assertEqual(dep_fixup.resolve_otel_pins({"DEP_OTEL_FIX": "0"}), {})
 
 
+class OtelFloorTest(unittest.TestCase):
+    """揃える先は「入っている sdk」ではなく「ray が要求する下限」。
+
+    なぜ: 実機イメージは api/sdk=1.26.0 に対し exporter=0.65b0 だった。
+    sdk 基準で揃えると exporter が 0.47b0 まで落ち、ray の
+    create_histogram(explicit_bucket_boundaries_advisory=...) が
+    TypeError になってノード起動が timeout する(1 敗)。
+    """
+
+    RAY_REQUIRES = [
+        "opentelemetry-sdk>=1.30.0; extra == 'default'",
+        "opentelemetry-exporter-prometheus; extra == 'default'",
+        "opentelemetry-proto; extra == 'default'",
+        "click>=7.0",
+    ]
+
+    def test_floor_is_read_from_ray_metadata(self) -> None:
+        mins = dep_fixup.parse_min_requires(self.RAY_REQUIRES)
+        self.assertEqual(mins["opentelemetry-sdk"], "1.30.0")
+
+    def test_upper_bound_only_requirements_are_ignored(self) -> None:
+        mins = dep_fixup.parse_min_requires(["opentelemetry-sdk<2"])
+        self.assertEqual(mins, {})
+
+    def test_highest_floor_wins_across_extras(self) -> None:
+        mins = dep_fixup.parse_min_requires([
+            "opentelemetry-sdk>=1.30.0; extra == 'default'",
+            "opentelemetry-sdk>=1.9.0; extra == 'observability'",
+        ])
+        self.assertEqual(mins["opentelemetry-sdk"], "1.30.0")
+
+    def test_prerelease_maps_back_to_its_stable_train(self) -> None:
+        # 実機の exporter=0.65b0 は 1.44 列。ray の下限 1.30.0 より新しいので
+        # こちらが揃える先になる(古い方へ引き戻すと ray が動かない)。
+        self.assertEqual(dep_fixup.stable_from_prerelease("0.65b0"), "1.44.0")
+        self.assertEqual(dep_fixup.stable_from_prerelease("0.47b0"), "1.26.0")
+        self.assertEqual(dep_fixup.stable_from_prerelease("0.51b0"), "1.30.0")
+
+    def test_stable_versions_are_not_treated_as_prerelease(self) -> None:
+        self.assertIsNone(dep_fixup.stable_from_prerelease("1.44.0"))
+        self.assertIsNone(dep_fixup.stable_from_prerelease(None))
+
+    def test_installed_sdk_below_ray_floor_is_detected(self) -> None:
+        # 実機の値。1.26.0 < 1.30.0 なので sdk を持ち上げる側に倒す。
+        self.assertLess(dep_fixup.version_key("1.26.0"),
+                        dep_fixup.version_key("1.30.0"))
+
+    def test_prerelease_versions_compare_without_crashing(self) -> None:
+        # semconv は 0.65b0 のようなプレリリース表記で来る。
+        self.assertLess(dep_fixup.version_key("0.47b0"),
+                        dep_fixup.version_key("0.65b0"))
+
+    def test_env_can_pin_the_floor(self) -> None:
+        self.assertEqual(dep_fixup.otel_sdk_floor({"DEP_OTEL_SDK_MIN": "1.44.0"}),
+                         "1.44.0")
+
+    def test_empty_env_disables_the_floor_step(self) -> None:
+        self.assertIsNone(dep_fixup.otel_sdk_floor({"DEP_OTEL_SDK_MIN": ""}))
+
+
 def mismatch_names(pins, versions):
     return [package for package, _, _ in dep_fixup.mismatched(pins, versions)]
 
