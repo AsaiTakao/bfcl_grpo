@@ -1,3 +1,6 @@
 {"step": 0, "key": "val-core/bfcl_multi_turn/reward/mean@3", "value": 0.034, "ts": 1785744566.0058944, "mt": 0.034, "st": 0.01, "st_baseline": 0.01, "st_penalty": 0.0}
 {"step": 2, "key": "val-core/bfcl_multi_turn/reward/mean@3", "value": 0.034, "ts": 1785744866.0245, "mt": 0.034, "st": 0.01, "st_baseline": 0.01, "st_penalty": 0.0}
 {"step": 3, "key": "val-core/bfcl_multi_turn/reward/mean@3", "value": 0.034, "ts": 1785745111.0367799, "mt": 0.034, "st": 0.01, "st_baseline": 0.01, "st_penalty": 0.0}
+{"step": 0, "key": "val-core/bfcl_multi_turn/reward/mean@3", "value": 0.034, "ts": 1785978035.1607718, "mt": 0.034, "st": 0.01, "st_baseline": 0.01, "st_penalty": 0.0}
+{"step": 2, "key": "val-core/bfcl_multi_turn/reward/mean@3", "value": 0.0245, "ts": 1785978320.1763122, "mt": 0.034, "st": 0.0, "st_baseline": 0.01, "st_penalty": -0.0095}
+{"step": 3, "key": "val-core/bfcl_multi_turn/reward/mean@3", "value": 0.0245, "ts": 1785978535.1878383, "mt": 0.034, "st": 0.0, "st_baseline": 0.01, "st_penalty": -0.0095}

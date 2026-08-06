@@ -23,7 +23,9 @@ create_kwargs の "mode" で 2 系統を切り替える(データ側が指定):
                    process 履歴 + outcome を mt_reward で結合し、
                    トラジェクトリのスカラ報酬を返す。
   mode="ast"
-  - execute(): 呼び出しを記録するだけ(observation に正解のヒントは出さない)。
+  - execute(): 最初の 1 回だけ呼び出しを記録する(observation に正解のヒントは
+               出さない)。2 回目以降は採点に混ぜない — 同じ呼び出しの繰り返しは
+               ast_match の超過ペナルティで満点を 0 点にしてしまうため。
   - calc_reward(): ast_match.match_score による一致率 [0,1]。
 
 verl の BaseTool import はバージョン差に備えて defensive に行う。
@@ -145,6 +147,18 @@ class BFCLMultiTurnTool(BaseTool):
         if sess is None:
             return "[error] セッション未初期化", 0.0, {"error": "no_session"}
 
+        if sess["mode"] == "ast" and sess["predicted_calls"]:
+            # 2 回目以降は採点に混ぜない。ast_match は「期待より多い呼び出し」を
+            # 減点するため、同じ正解を 2 回言うだけでスコアが 1.0 -> 0.0 に落ちる。
+            # 実機ログでは observation に情報が無いせいでモデルが同じ呼び出しを
+            # max_assistant_turns まで繰り返し、シングルターン報酬が全滅していた。
+            return (
+                "[warn] このタスクは 1 ターンで完結します。追加の呼び出しは採点対象外です。"
+                "これ以上ツールを呼ばず、結果をユーザーに文章で回答してください。",
+                0.0,
+                {"n_calls": 0, "mode": "ast", "ignored": True},
+            )
+
         tool_calls = self._parse_tool_calls(parameters)
         if not tool_calls:
             # 呼び出しが無い/パース不能: process 0、observation で軽く矯正。
@@ -163,8 +177,11 @@ class BFCLMultiTurnTool(BaseTool):
             # (正誤は calc_reward の AST 照合で評価する)。
             sess["process_rewards"].append(1.0)
             names = ", ".join(str(c.get("name", "?")) for c in tool_calls)
+            # 「もう呼ばなくてよい」と明示する。これが無いと成否が分からないまま
+            # 同じ呼び出しを繰り返し、超過ペナルティで報酬が 0 になる。
             return (
-                f"[ok] {len(tool_calls)} 件の呼び出しを受理しました: {names}",
+                f"[ok] {len(tool_calls)} 件の呼び出しを受理しました: {names}。"
+                "これで十分です。ツールを再度呼ばず、ユーザーに回答してください。",
                 1.0,
                 {"n_calls": len(tool_calls), "mode": "ast"},
             )

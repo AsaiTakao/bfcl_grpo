@@ -193,6 +193,30 @@ class AstModeToolTest(unittest.TestCase):
 
         self.assertEqual(asyncio.run(run()), 0.0)
 
+    def test_repeated_identical_call_still_scores_full(self) -> None:
+        """同じ正解を繰り返しても満点のまま(実機のループで報酬が全滅した回帰)。
+
+        ast_match は期待より多い呼び出しを減点するため、2 回目以降を採点に
+        混ぜると 1.0 -> 0.0 に落ちる。ツール側で 2 回目以降を捨てる。
+        """
+        tool = self._tool()
+        gt = [{"get_weather": {"city": ["Tokyo"]}}]
+        call = {"tool_calls": [{"name": "get_weather",
+                                "arguments": {"city": "Tokyo"}}]}
+
+        async def run() -> float:
+            iid = await tool.create(mode="ast", ast_ground_truth=gt)
+            await tool.execute(iid, call)
+            for _ in range(9):        # 実機では 10 回以上ループしていた
+                obs, process, metrics = await tool.execute(iid, call)
+                self.assertTrue(metrics.get("ignored"))
+                self.assertEqual(process, 0.0)
+                # 打ち切りを促す文言を返し、ループを断ち切る。
+                self.assertIn("これ以上ツールを呼ばず", obs)
+            return await tool.calc_reward(iid)
+
+        self.assertEqual(asyncio.run(run()), 1.0)
+
     def test_empty_tool_calls_scores_zero(self) -> None:
         tool = self._tool()
         gt = [{"get_weather": {"city": ["Tokyo"]}}]
